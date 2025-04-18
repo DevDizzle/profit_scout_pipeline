@@ -1,0 +1,91 @@
+# cicd/cloudbuild.yaml - Google Cloud Build configuration
+# Builds Docker images for each service and pushes to Google Artifact Registry.
+
+steps:
+  # --- Build Listener Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Listener'
+    dir: 'services/listener' # Build context
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener:latest'
+      - '-t'
+      # Use SHORT_SHA instead of COMMIT_SHA for tagging
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener:${SHORT_SHA}'
+      - '.'
+
+  # --- Build Subscriber Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Subscriber'
+    dir: 'services/subscriber'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber:${SHORT_SHA}' # Use SHORT_SHA
+      - '.'
+
+  # --- Build Price Loader Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Price Loader'
+    dir: 'services/price_loader'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/price-loader:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/price-loader:${SHORT_SHA}' # Use SHORT_SHA
+      - '.'
+
+  # --- Build Ratio Calculator Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Ratio Calculator'
+    dir: 'services/ratio_calculator'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator:${SHORT_SHA}' # Use SHORT_SHA
+      - '.'
+
+  # --- Build PDF Summarizer Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build PDF Summarizer'
+    dir: 'services/pdf_summarizer'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer:${SHORT_SHA}' # Use SHORT_SHA
+      - '.'
+
+  # --- Build News Summarizer Service ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build News Summarizer'
+    dir: 'services/news_summarizer'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer:${SHORT_SHA}' # Use SHORT_SHA
+      - '.'
+
+# Specify images to push to Artifact Registry after successful build steps.
+# Cloud Build pushes all tags built for these image paths (latest and SHORT_SHA).
+images:
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener'
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber'
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/price-loader'
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator'
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer'
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer'
+
+# Optional: Set timeout/machine type
+# timeout: 1200s
+# options:
+#   machineType: 'N1_HIGHCPU_8'
