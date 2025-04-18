@@ -1,0 +1,10 @@
+# Data Handling & APIs
+pandas
+google-cloud-bigquery
+google-cloud-storage
+requests
+sec-api
+
+# Web Framework & Server (for Cloud Run entry point)
+Flask
+gunicorn

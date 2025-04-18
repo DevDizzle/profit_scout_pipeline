@@ -1,0 +1,8 @@
+# requirements.in for ratio_calculator service
+pandas
+numpy
+google-cloud-bigquery
+google-cloud-secret-manager
+google-generativeai
+tqdm      
+tenacity  
