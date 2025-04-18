@@ -5,76 +5,64 @@ steps:
   # --- Build Listener Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build Listener'
-    dir: '../services/listener'
+    dir: 'services/listener'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener:${SHORT_SHA}'
       - '.'
 
   # --- Build Subscriber Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build Subscriber'
-    dir: '../services/subscriber'
+    dir: 'services/subscriber'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber:${SHORT_SHA}'
       - '.'
 
   # --- Build Price Loader Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build Price Loader'
-    dir: '../services/price_loader'
+    dir: 'services/price_loader'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/price-loader:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/price-loader:${SHORT_SHA}'
       - '.'
 
   # --- Build Ratio Calculator Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build Ratio Calculator'
-    dir: '../services/ratio_calculator'
+    dir: 'services/ratio_calculator'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator:${SHORT_SHA}'
       - '.'
 
   # --- Build PDF Summarizer Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build PDF Summarizer'
-    dir: '../services/pdf_summarizer'
+    dir: 'services/pdf_summarizer'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer:${SHORT_SHA}'
       - '.'
 
   # --- Build News Summarizer Service ---
   - name: 'gcr.io/cloud-builders/docker'
     id: 'Build News Summarizer'
-    dir: '../services/news_summarizer'
+    dir: 'services/news_summarizer'
     args:
       - 'build'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer:latest'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer:${SHORT_SHA}'
       - '.'
 
-# Specify images to push to Artifact Registry after successful build steps.
+# Images to push to Artifact Registry
 images:
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/listener'
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/subscriber'
@@ -82,8 +70,3 @@ images:
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/ratio-calculator'
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/pdf-summarizer'
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/profit-scout-repo/news-summarizer'
-
-# Optional: Set timeout/machine type
-# timeout: 1200s
-# options:
-#   machineType: 'N1_HIGHCPU_8'
