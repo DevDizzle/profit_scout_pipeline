@@ -1,3 +1,5 @@
+# .gitignore
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -43,7 +45,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Environments
+# Environments / Local Config
 .env
 .venv
 env/
@@ -52,9 +54,23 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyderworkspace
+# Terraform state files (if backend isn't used or fails)
+terraform.tfstate
+terraform.tfstate.backup
+*.tfplan
+
+# Terraform crash log
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform state locking
+.terraform.lock.hcl
+
+# Terraform runtime directory
+.terraform/
 
 # VSCode settings
 .vscode/
@@ -68,3 +84,7 @@ instance/
 # Temporary files
 *.tmp
 *~
+
+# OS generated files
+.DS_Store
+Thumbs.db
