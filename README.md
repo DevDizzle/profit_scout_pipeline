@@ -241,4 +241,3 @@ Run `terraform init`, `terraform plan`, and `terraform apply` within `infrastruc
 ## Dependencies
 
 Dependencies are managed *per service* using `requirements.in` (for direct dependencies) and `requirements.txt` (for pinned, resolved dependencies with hashes). Use `pip-compile --generate-hashes` within each service directory to update `requirements.txt` after modifying `requirements.in`. Install using `pip install --require-hashes -r requirements.txt`.
->>>>>>> master

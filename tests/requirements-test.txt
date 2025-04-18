@@ -1,0 +1,12 @@
+# tests/requirements-test.txt
+
+pytest
+pytest-cov
+pytest-mock
+pytest-asyncio
+pytest-flask # Keeping this based on your original comment, remove if not testing Flask components
+
+# Added based on imports in listener.py and test_listener.py
+tenacity
+websockets
+google-cloud-secret-manager
