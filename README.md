@@ -32,7 +32,7 @@ The pipeline utilizes a microservices architecture running primarily on Cloud Ru
 ## Project Structure
 
 This project uses a monorepo structure:
-
+'''
 profit_scout_pipeline/
 |
 ├── services/                    # Code for individual microservices
@@ -70,7 +70,7 @@ profit_scout_pipeline/
 ├── cicd/                        # CI/CD Pipeline Definitions
 │   └── cloudbuild.yaml          # Cloud Build: Builds service images, pushes to Artifact Registry
 │
-├── tests/                       # Automated Tests (Placeholder - TO BE ADDED)
+├── tests/                       # Automated Tests
 │   ├── unit/
 │   └── integration/
 │
@@ -78,7 +78,7 @@ profit_scout_pipeline/
 ├── README.md                    # This file
 └── .env.example                 # Template for local development environment variables
 
-
+'''
 ## Components Deep Dive
 
 *(This section provides a high-level overview. More details are in the source code.)*
