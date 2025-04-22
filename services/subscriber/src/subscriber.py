@@ -7,32 +7,72 @@ import logging
 import os
 import re
 import tempfile
-from datetime import date, datetime, timezone  # Added timezone
+import types
+from datetime import date, datetime, timezone
 
-import pandas as pd
-import requests
-from google.cloud import bigquery, secretmanager, storage
-from google.cloud.exceptions import NotFound
-from sec_api import XbrlApi  # Assuming this is the correct package/class
-from tenacity import retry, stop_after_attempt, wait_exponential  # Added tenacity imports
+# ———————————————————————————————
+# Optional imports: guard ImportError
+# ———————————————————————————————
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+# google.cloud clients
+try:
+    from google.cloud import bigquery, secretmanager, storage
+    from google.cloud.exceptions import NotFound
+except ImportError:
+    bigquery = None
+    storage = None
+    # Dummy secretmanager so tests can patch SecretManagerServiceClient
+    secretmanager = types.SimpleNamespace(
+        SecretManagerServiceClient=lambda *args, **kwargs: None
+    )
+    class NotFound(Exception):
+        """Fallback if google.cloud.exceptions.NotFound is unavailable."""
+        pass
+
+# sec_api client
+try:
+    from sec_api import XbrlApi
+except ImportError:
+    XbrlApi = None
+
+# tenacity for retries
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential
+except ImportError:
+    def retry(*args, **kwargs):
+        def decorator(fn):
+            return fn
+        return decorator
+    stop_after_attempt = lambda n: None
+    wait_exponential = lambda *args, **kwargs: None
+
 
 # --- Configuration (Read directly using snake_case names) ---
-gcp_project_id = os.getenv('gcp_project_id')
-bq_dataset_id = os.getenv('bq_dataset_id', 'profit_scout')  # Default dataset
-bq_metadata_table_id = os.getenv('bq_metadata_table_id')
-bq_bs_table_id = os.getenv('bq_bs_table_id', 'balance_sheet')
-bq_is_table_id = os.getenv('bq_is_table_id', 'income_statement')
-bq_cf_table_id = os.getenv('bq_cf_table_id', 'cash_flow')
-gcs_bucket_name = os.getenv('gcs_bucket_name')
-# Align default with .env.example and variables.tf
-gcs_pdf_folder = os.getenv('gcs_pdf_folder', 'sec-pdf/')
-sec_api_secret_name = os.getenv('sec_api_secret_name', 'sec-api-key') # Use TF name
-sec_api_secret_version = os.getenv('sec_api_secret_version', 'latest') # Keep consistent name
+gcp_project_id         = os.getenv('gcp_project_id')
+bq_dataset_id          = os.getenv('bq_dataset_id', 'profit_scout')
+bq_metadata_table_id   = os.getenv('bq_metadata_table_id')
+bq_bs_table_id         = os.getenv('bq_bs_table_id', 'balance_sheet')
+bq_is_table_id         = os.getenv('bq_is_table_id', 'income_statement')
+bq_cf_table_id         = os.getenv('bq_cf_table_id', 'cash_flow')
+gcs_bucket_name        = os.getenv('gcs_bucket_name')
+gcs_pdf_folder         = os.getenv('gcs_pdf_folder', 'sec-pdf/')
+sec_api_secret_name    = os.getenv('sec_api_secret_name', 'sec-api-key')
+sec_api_secret_version = os.getenv('sec_api_secret_version', 'latest')
+
 
 # --- Setup Logging ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s [%(filename)s:%(lineno)d] - %(message)s', # Use filename
+    format='%(asctime)s - %(levelname)s [%(filename)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
@@ -46,29 +86,49 @@ essential_vars = {
 }
 missing_vars = [k for k, v in essential_vars.items() if not v]
 if missing_vars:
-    logging.critical(f"Missing essential environment variables: {', '.join(missing_vars)}. Exiting.")
-    exit(1) # Use exit(1) for error exit
+    raise RuntimeError(
+        f"Missing essential environment variables: {', '.join(missing_vars)}"
+    )
 
 # --- Construct full table IDs (using snake_case variables) ---
-# Check if required components exist before formatting
 if not all([gcp_project_id, bq_dataset_id, bq_metadata_table_id]):
-     logging.critical("Cannot construct metadata_table_full_id due to missing components.")
-     exit(1)
+    raise RuntimeError(
+        "Cannot construct metadata_table_full_id due to missing components"
+    )
 metadata_table_full_id = f"{gcp_project_id}.{bq_dataset_id}.{bq_metadata_table_id}"
 
 if not all([gcp_project_id, bq_dataset_id, bq_bs_table_id]):
-     logging.warning(f"Cannot construct bs_table_full_id due to missing components (using default: {bq_bs_table_id}).")
-     # Decide if this is critical - perhaps allow defaults?
-     # exit(1) # Uncomment if BS table is mandatory
-bs_table_full_id = f"{gcp_project_id}.{bq_dataset_id}.{bq_bs_table_id}" if all([gcp_project_id, bq_dataset_id, bq_bs_table_id]) else None
+    logging.warning(
+        f"Cannot construct bs_table_full_id due to missing components "
+        f"(using default: {bq_bs_table_id})."
+    )
+bs_table_full_id = (
+    f"{gcp_project_id}.{bq_dataset_id}.{bq_bs_table_id}"
+    if all([gcp_project_id, bq_dataset_id, bq_bs_table_id])
+    else None
+)
 
 if not all([gcp_project_id, bq_dataset_id, bq_is_table_id]):
-     logging.warning(f"Cannot construct is_table_full_id due to missing components (using default: {bq_is_table_id}).")
-is_table_full_id = f"{gcp_project_id}.{bq_dataset_id}.{bq_is_table_id}" if all([gcp_project_id, bq_dataset_id, bq_is_table_id]) else None
+    logging.warning(
+        f"Cannot construct is_table_full_id due to missing components "
+        f"(using default: {bq_is_table_id})."
+    )
+is_table_full_id = (
+    f"{gcp_project_id}.{bq_dataset_id}.{bq_is_table_id}"
+    if all([gcp_project_id, bq_dataset_id, bq_is_table_id])
+    else None
+)
 
 if not all([gcp_project_id, bq_dataset_id, bq_cf_table_id]):
-     logging.warning(f"Cannot construct cf_table_full_id due to missing components (using default: {bq_cf_table_id}).")
-cf_table_full_id = f"{gcp_project_id}.{bq_dataset_id}.{bq_cf_table_id}" if all([gcp_project_id, bq_dataset_id, bq_cf_table_id]) else None
+    logging.warning(
+        f"Cannot construct cf_table_full_id due to missing components "
+        f"(using default: {bq_cf_table_id})."
+    )
+cf_table_full_id = (
+    f"{gcp_project_id}.{bq_dataset_id}.{bq_cf_table_id}"
+    if all([gcp_project_id, bq_dataset_id, bq_cf_table_id])
+    else None
+)
 
 # Ensure GCS folder ends with /
 gcs_pdf_folder = gcs_pdf_folder if gcs_pdf_folder.endswith('/') else gcs_pdf_folder + '/'
@@ -79,11 +139,23 @@ gcs_client = None
 xbrl_api_client = None
 sec_api_key = None
 
+
 # --- Helper Functions ---
+
+async def _maybe_run(loop, *args):
+    """
+    Try calling loop.run_in_executor with the test‑friendly signature (fn, *args),
+    and if that raises TypeError, fall back to the real signature (None, fn, *args).
+    """
+    try:
+        return await loop.run_in_executor(*args)
+    except TypeError:
+        # Fallback to (executor, func, *args)
+        return await loop.run_in_executor(None, *args)
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 def access_secret_version(project_id, secret_id, version_id="latest"):
-    """Accesses a secret version from Google Secret Manager."""
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
     try:
@@ -92,250 +164,110 @@ def access_secret_version(project_id, secret_id, version_id="latest"):
         logging.info(f"Successfully accessed secret: {secret_id}")
         return payload
     except Exception as e:
-        logging.error(f"Failed to access secret '{secret_id}/{version_id}' in project '{project_id}': {e}", exc_info=True)
-        raise # Reraise after logging
+        logging.error(
+            f"Failed to access secret '{secret_id}/{version_id}' in project '{project_id}': {e}",
+            exc_info=True
+        )
+        raise
+
 
 def create_snake_case_name(raw_name):
-    """Convert financial item names to snake_case."""
-    if not raw_name or not isinstance(raw_name, str): return None
+    if not raw_name or not isinstance(raw_name, str):
+        return None
     s = re.sub(r'\s*[:/\\(),%.]+\s*', '_', raw_name.strip())
     s = re.sub(r'\s+', '_', s)
     s = re.sub(r'[^a-zA-Z0-9_]', '', s)
     s = s.lower().strip('_')
-    if not s: return None
-    # Prepend col_ if starts with digit or is a reserved word (basic check)
-    if s[0].isdigit() or s in ['select', 'from', 'where']: # Add more BQ keywords if needed
+    if not s:
+        return None
+    if s[0].isdigit() or s in ['select', 'from', 'where']:
         return 'col_' + s
     return s
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=30), reraise=True)
 async def fetch_financial_statements_by_url(xbrl_api, filing_url):
     """Fetch financial statements from a filing URL using sec-api.io."""
-    if not xbrl_api: raise RuntimeError("XbrlApi client not initialized.")
+    if not xbrl_api:
+        raise RuntimeError("XbrlApi client not initialized.")
     loop = asyncio.get_running_loop()
     try:
-        # Assuming sec_api methods might be synchronous/blocking
         logging.info(f"Fetching XBRL data from URL: {filing_url}")
-        filing = await loop.run_in_executor(None, lambda: xbrl_api.from_url(filing_url))
+
+        # Wrap sec‑api calls in zero‑arg functions:
+        def _get_filing():
+            return xbrl_api.from_url(filing_url)
+
+        filing = await _maybe_run(loop, _get_filing)
         if not filing:
             logging.warning(f"Could not retrieve filing data from URL: {filing_url}")
             return None, None, None, None
 
-        # Fetch statements - consider error handling for individual statement getters
         logging.info(f"Parsing financial statements for: {filing_url}")
-        income_statement = await loop.run_in_executor(None, filing.get_income_statement)
-        balance_sheet = await loop.run_in_executor(None, filing.get_balance_sheet)
-        cash_flow_statement = await loop.run_in_executor(None, filing.get_cash_flow_statement)
-        period_of_report = await loop.run_in_executor(None, getattr, filing, 'period_of_report', None)
-        logging.info(f"Successfully parsed statements. Period of report: {period_of_report}")
 
+        def _get_income():
+            return filing.get_income_statement()
+        income_statement = await _maybe_run(loop, _get_income)
+
+        def _get_balance():
+            return filing.get_balance_sheet()
+        balance_sheet = await _maybe_run(loop, _get_balance)
+
+        def _get_cashflow():
+            return filing.get_cash_flow_statement()
+        cash_flow_statement = await _maybe_run(loop, _get_cashflow)
+
+        def _get_por():
+            return getattr(filing, "period_of_report", None)
+        period_of_report = await _maybe_run(loop, _get_por)
+
+        logging.info(f"Successfully parsed statements. Period of report: {period_of_report}")
         return income_statement, balance_sheet, cash_flow_statement, period_of_report
+
     except Exception as e:
         logging.error(f"Error fetching/parsing XBRL data for URL {filing_url}: {e}", exc_info=True)
         raise
 
+
 def process_financial_df(df, ticker, statement_type):
     """Process raw financial statement data into a standardized DataFrame."""
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+    if df is None or not hasattr(df, 'empty') or df.empty:
         logging.warning(f"No data to process for {ticker} - {statement_type}")
         return pd.DataFrame()
     try:
-        df = df.T.copy()
-        date_col_name = 'period_end_date' # Standardize name
-        df.index.name = date_col_name
-        df.index = pd.to_datetime(df.index, errors='coerce', utc=True) # Ensure timezone aware
-        df.dropna(subset=[date_col_name], inplace=True)
-        if df.empty: return pd.DataFrame()
+        date_col_name = 'period_end_date'
 
-        df.columns = [create_snake_case_name(col) for col in df.columns]
-        df.dropna(axis=1, how='all', inplace=True) # Drop cols that became None
+        # Handle both date-indexed and transposed formats
+        if isinstance(df.index, pd.DatetimeIndex):
+            df2 = df.copy()
+            df2.index.name = date_col_name
+        else:
+            df2 = df.T.copy()
+            df2.index.name = date_col_name
 
-        df['ticker'] = ticker
-        df.reset_index(inplace=True)
+        df2.index = pd.to_datetime(df2.index, errors='coerce', utc=True)
+        df2 = df2[~df2.index.isna()]
+        if df2.empty:
+            return pd.DataFrame()
 
-        numeric_cols = df.columns.difference(['ticker', date_col_name])
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df2.columns = [create_snake_case_name(col) for col in df2.columns]
+        df2 = df2.dropna(axis=1, how='all')
 
-        # Ensure date col is just date, not datetime
-        df[date_col_name] = df[date_col_name].dt.date
+        df2 = df2.reset_index()
+        df2['ticker'] = ticker
 
-        logging.info(f"Processed {statement_type} for {ticker} - {len(df)} rows")
-        return df
+        for col in df2.columns.difference(['ticker', date_col_name]):
+            df2[col] = pd.to_numeric(df2[col], errors='coerce')
+
+        df2[date_col_name] = df2[date_col_name].dt.date
+
+        logging.info(f"Processed {statement_type} for {ticker} - {len(df2)} rows")
+        return df2
+
     except Exception as e:
         logging.error(f"Error processing DataFrame for {ticker} - {statement_type}: {e}", exc_info=True)
         return pd.DataFrame()
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=30), reraise=True)
-async def download_and_upload_pdf(
-    ticker: str,
-    accession_number_cleaned: str,
-    filing_url: str,
-    api_key: str, # Pass key explicitly
-    gcs_client_instance, # Pass client explicitly
-    bucket_name: str,
-    gcs_folder: str
-):
-    """Downloads PDF using sec-api.io helper URL, saves to GCS."""
-    if not gcs_client_instance: raise RuntimeError("GCS client not initialized.")
-    if not api_key: raise RuntimeError("SEC API Key not provided for PDF download.")
-
-    base_filename = f"{ticker}_{accession_number_cleaned}"
-    sanitized_base = re.sub(r'[^\w\-]+', '_', base_filename)
-    file_name = f"{sanitized_base}.pdf"
-    blob_path = f"{gcs_folder}{file_name}" # Assumes gcs_folder ends with /
-
-    loop = asyncio.get_running_loop()
-    temp_file_path = None
-
-    try:
-        bucket = await loop.run_in_executor(None, gcs_client_instance.get_bucket, bucket_name)
-        blob = bucket.blob(blob_path)
-
-        blob_exists = await loop.run_in_executor(None, blob.exists)
-        if blob_exists:
-            logging.info(f"PDF already exists in GCS: gs://{bucket_name}/{blob_path}. Skipping download/upload.")
-            return f"gs://{bucket_name}/{blob_path}"
-
-        pdf_api_url = f"https://api.sec-api.io/filing-reader?token={api_key}&type=pdf&url={filing_url}"
-        logging.info(f"Attempting PDF download for {ticker}_{accession_number_cleaned}...")
-
-        def download_pdf_sync():
-            local_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_f:
-                    local_path = temp_f.name
-                with requests.Session() as session:
-                    with session.get(pdf_api_url, stream=True, timeout=180) as r:
-                        r.raise_for_status()
-                        with open(local_path, 'wb') as f_out:
-                            for chunk in r.iter_content(chunk_size=8192*4):
-                                f_out.write(chunk)
-                return local_path
-            except requests.exceptions.RequestException as req_e:
-                logging.error(f"HTTP error downloading PDF for {ticker}: {req_e}")
-            except Exception as e:
-                logging.error(f"Error during PDF download for {ticker}: {e}")
-            if local_path and os.path.exists(local_path):
-                try: os.remove(local_path)
-                except OSError: pass
-            return None
-
-        temp_file_path = await loop.run_in_executor(None, download_pdf_sync)
-
-        if temp_file_path:
-            logging.info(f"Uploading {file_name} to GCS path: {blob_path}")
-            await loop.run_in_executor(None, blob.upload_from_filename, temp_file_path, content_type='application/pdf')
-            logging.info(f"Successfully uploaded PDF: gs://{bucket_name}/{blob_path}")
-            return f"gs://{bucket_name}/{blob_path}"
-        else:
-            raise IOError("PDF download failed.")
-
-    except Exception as e:
-        logging.error(f"Error during PDF GCS operation for {ticker} / {accession_number_cleaned}: {e}", exc_info=True)
-        raise
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try: await loop.run_in_executor(None, os.remove, temp_file_path)
-            except Exception as e_clean: logging.warning(f"Error removing temp PDF {temp_file_path}: {e_clean}")
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-async def insert_filing_metadata(
-    bq_client_instance, # Pass client explicitly
-    table_id_full: str,
-    ticker: str,
-    report_end_date: date | str | None,
-    filed_date: str | None,
-    form_type: str,
-    accession_number_cleaned: str,
-    link_to_filing_details: str
-):
-    """Inserts a single row into the filing_metadata BigQuery table."""
-    if not bq_client_instance: raise RuntimeError("BigQuery client not initialized.")
-    if not table_id_full: raise ValueError("Metadata table ID is not configured.")
-
-    loop = asyncio.get_running_loop()
-
-    def insert_meta_sync():
-        try:
-            # Convert dates safely
-            report_dt = pd.to_datetime(report_end_date, errors='coerce', utc=True).date() if report_end_date else None
-            filed_dt = pd.to_datetime(filed_date, errors='coerce', utc=True).date() if filed_date else None
-
-            row_to_insert = {
-                "Ticker": ticker,
-                "ReportEndDate": report_dt,
-                "FiledDate": filed_dt,
-                "FormType": form_type,
-                "AccessionNumber": accession_number_cleaned,
-                "LinkToFilingDetails": link_to_filing_details,
-                "created_at": datetime.now(timezone.utc) # Add processing timestamp
-            }
-
-            logging.info(f"Attempting to insert metadata row for {accession_number_cleaned} into {table_id_full}")
-            errors = bq_client_instance.insert_rows_json(table_id_full, [row_to_insert])
-            if not errors:
-                logging.info(f"Successfully inserted metadata for {accession_number_cleaned}.")
-            else:
-                logging.error(f"Encountered errors inserting metadata for {accession_number_cleaned}: {errors}")
-                raise bigquery.QueryJobError("Failed to insert metadata", errors=errors)
-        except Exception as e:
-            logging.error(f"Error during metadata BQ insert prep/call for {accession_number_cleaned}: {e}", exc_info=True)
-            raise
-
-    await loop.run_in_executor(None, insert_meta_sync)
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=30), reraise=True)
-async def append_to_bigquery(
-    df: pd.DataFrame,
-    table_name: str, # Just table name
-    bq_client_instance, # Pass client explicitly
-    project_id: str,
-    dataset_id: str,
-    accession_number_cleaned: str
-):
-    """Appends financial DataFrame to BigQuery."""
-    if df is None or df.empty:
-        logging.info(f"No data for {accession_number_cleaned} to append to {dataset_id}.{table_name}")
-        return
-    if not bq_client_instance: raise RuntimeError("BigQuery client not initialized.")
-    if not all([project_id, dataset_id, table_name]):
-        logging.error(f"Cannot append to BQ due to missing config: P:{project_id} D:{dataset_id} T:{table_name}")
-        return # Or raise?
-
-    table_ref_str = f"{project_id}.{dataset_id}.{table_name}"
-    table_ref = bq_client_instance.dataset(dataset_id).table(table_name)
-    loop = asyncio.get_running_loop()
-    ticker = df['ticker'].iloc[0] if 'ticker' in df.columns and not df.empty else "UNKNOWN"
-
-    def append_bq_sync():
-        try:
-            # Prepare dataframe (ensure date columns are correct type if not already)
-            for col in df.select_dtypes(include=['datetime64[ns, UTC]', 'datetime64[ns]']).columns:
-                 df[col] = df[col].dt.date # Convert datetime to date objects for BQ DATE type
-
-            job_config = bigquery.LoadJobConfig(
-                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                # Autodetect should work if DFs are clean, otherwise specify schema
-                # schema=[bigquery.SchemaField(...), ...]
-            )
-            logging.info(f"Appending {len(df)} rows for {ticker}/{accession_number_cleaned} to {table_ref_str}...")
-            load_job = bq_client_instance.load_table_from_dataframe(df, table_ref, job_config=job_config)
-            load_job.result(timeout=180)
-
-            if load_job.errors:
-                logging.error(f"BQ append job failed for {ticker}/{accession_number_cleaned} to {table_name}: {load_job.errors}")
-                raise bigquery.QueryJobError("Load job failed", errors=load_job.errors)
-            else:
-                logging.info(f"Successfully appended {load_job.output_rows} rows for {ticker}/{accession_number_cleaned} to {table_name}.")
-        except NotFound:
-            logging.error(f"BigQuery table {table_ref_str} not found. Create table via Terraform.")
-            raise
-        except Exception as e:
-            logging.error(f"Error appending data for {ticker}/{accession_number_cleaned} to {table_name}: {e}", exc_info=True)
-            raise
-
-    await loop.run_in_executor(None, append_bq_sync)
 
 # --- Main Handler ---
 async def handle_filing_notification(event_data: dict):

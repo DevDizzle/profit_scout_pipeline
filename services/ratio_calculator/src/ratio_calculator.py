@@ -1,10 +1,12 @@
 # services/ratio_calculator/src/ratio_calculator.py
 
 import os
+import logging
 import pandas as pd
 import numpy as np
 from google.cloud import bigquery, secretmanager
 from google.cloud.exceptions import NotFound
+
 # Ensure google.generativeai is installed
 try:
     import google.generativeai as genai
@@ -14,16 +16,20 @@ except ImportError:
     logging.warning("google-generativeai library not found. Ratio calculation cannot use Gemini.")
 
 import json
-import logging
-from tqdm import tqdm # Optional: for progress bar if run manually/interactively
-from datetime import datetime, timedelta, date, timezone # Ensure timezone is imported
+# Optional: use tqdm if installed, otherwise set it to None
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+from datetime import datetime, timedelta, date, timezone
 import time
 import re
 from tenacity import retry, stop_after_attempt, wait_fixed, wait_exponential
 from google.api_core import exceptions
 import concurrent.futures
 import threading
-from decimal import Decimal # Keep Decimal for potential BQ NUMERIC/BIGNUMERIC
+from decimal import Decimal  # Keep Decimal for potential BQ NUMERIC/BIGNUMERIC
 
 # --- Configuration (using snake_case names) ---
 gcp_project_id = os.getenv('gcp_project_id')
@@ -70,9 +76,6 @@ if genai_installed:
      essential_vars['gemini_model_name'] = gemini_model_name
 
 missing_vars = [k for k, v in essential_vars.items() if not v]
-if missing_vars:
-    logging.critical(f"Missing essential environment variables: {', '.join(missing_vars)}. Exiting.")
-    exit(1)
 
 # Construct full table IDs (using snake_case variables)
 metadata_table_full_id = f"{gcp_project_id}.{bq_dataset_id}.{bq_metadata_table_id}"

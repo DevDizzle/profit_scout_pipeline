@@ -1,12 +1,26 @@
-# tests/requirements-test.txt
+# profit_scout_pipeline/tests/requirements-test.txt
+# Combined requirements for unit and integration tests
 
+# Testing framework & utilities
 pytest
-pytest-cov
-pytest-mock
-pytest-asyncio
-pytest-flask # Keeping this based on your original comment, remove if not testing Flask components
+pytest-asyncio 
+pytest-mock     
+pytest-cov      
+pytest-flask   
 
-# Added based on imports in listener.py and test_listener.py
-tenacity
-websockets
+# Google Cloud stack
+google-cloud-storage
 google-cloud-secret-manager
+google-generativeai
+google-cloud-bigquery  
+google-cloud-core   
+google-auth          
+
+# Core application / ML / Finance stack dependencies
+Flask          
+numpy           
+tenacity        
+pandas         
+yfinance       
+websockets      
+tqdm            
