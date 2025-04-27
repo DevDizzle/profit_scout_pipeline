@@ -1,5 +1,0 @@
-# Listener dependencies
-websockets
-google-cloud-pubsub
-google-cloud-secret-manager
-tenacity

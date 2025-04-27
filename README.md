@@ -1,130 +1,129 @@
-# Profit Scout - Financial Data & Analysis Pipeline
+# Profit Scout - Financial Data & Analysis Pipeline (v2 - Workflow Architecture)
 
 ## Overview
 
-This project implements a data pipeline on Google Cloud Platform (GCP) designed to ingest real-time SEC filings (10-K, 10-Q), load daily stock prices, generate AI-driven summaries (from filings and recent news), and calculate financial ratios. The processed data (structured financials, PDFs, text summaries, ratios) is stored in BigQuery and Google Cloud Storage (GCS), providing a foundation for financial analysis, ML modeling, and application backends.
+This project implements a data pipeline on Google Cloud Platform (GCP) designed to ingest SEC filings (10-K, 10-Q), load daily stock prices, generate AI-driven summaries (from filings and recent news), and calculate financial ratios. The pipeline leverages **Cloud Run Jobs orchestrated by Cloud Workflow** for the main filing processing, ensuring modularity and reliability. The processed data (structured financials, PDFs, text summaries, ratios) is stored in BigQuery and Google Cloud Storage (GCS), providing a foundation for financial analysis, ML modeling, and application backends.
 
-## Architecture Overview
+## Architecture Overview (v2)
 
-The pipeline utilizes a microservices architecture running primarily on Cloud Run (Services and Jobs), orchestrated through Pub/Sub, Eventarc, and Cloud Scheduler.
+The pipeline utilizes **Cloud Run Jobs** for discrete processing tasks, orchestrated primarily by **Cloud Workflow** for the main filing ingestion and analysis sequence. Standalone **Cloud Run Jobs** triggered by **Cloud Scheduler** handle periodic tasks like price loading and ratio calculation.
 
-**(Optional: Consider adding a Mermaid diagram here later to visualize the flow)**
+**![Profit Scout Data Pipeline Overview](../images/data_pipeline.png)
+
+*Figure: Profit Scout Data Pipeline Overview***
 
 **Key Data Flows:**
 
-1.  **SEC Filing Ingestion:**
-    * `listener` (Cloud Run Service) receives real-time filing events via WebSocket.
-    * Publishes relevant filing details (10-K/Q) to a Pub/Sub topic (`sec-filing-notification`).
-    * `subscriber` (Cloud Run Service) consumes Pub/Sub messages from its subscription.
-    * `subscriber` fetches XBRL data & PDF (via sec-api), writes financials (`balance_sheet`, `income_statement`, `cash_flow`) & metadata (`filing_metadata`) to BigQuery, uploads PDF (named `ticker_ANcleaned.pdf`) to GCS.
-2.  **PDF Analysis (Event-Driven):**
-    * GCS PDF upload by `subscriber` triggers Eventarc.
-    * Eventarc invokes `pdf_summarizer` (Cloud Run Service).
-    * `pdf_summarizer` downloads PDF, uses Gemini File API for qualitative analysis, saves result (`QualitativeAnalysis_ticker_ANcleaned.txt`) to GCS.
-    * Eventarc invokes `news_summarizer` (Cloud Run Service) via a separate trigger on the same GCS event.
-    * `news_summarizer` parses filename, queries BQ (`filing_metadata`) for filing date, uses Vertex AI Gemini + Search Tool for recent news analysis (30-day lookback), saves result (`NewsSummary_ticker_ANcleaned.txt`) to GCS.
-3.  **Batch Processing (Scheduled):**
-    * Cloud Scheduler triggers `price_loader` (Cloud Run Job) daily.
-    * `price_loader` queries BQ `filing_metadata` for tickers, fetches incremental daily prices from `yfinance`, appends to BQ `price_data` table.
-    * Cloud Scheduler triggers `ratio_calculator` (Cloud Run Job) periodically (e.g., daily/hourly).
-    * `ratio_calculator` queries BQ (`filing_metadata`, `financial_ratios`) for unprocessed filings, fetches required BQ data, uses Gemini API for calculations, appends results to BQ `financial_ratios` table.
+1.  **Scheduled Filing Processing (via Cloud Workflow):**
+    * Cloud Scheduler triggers a Cloud Workflow (e.g., M-F 6 AM).
+    * **Step 1 (`fetch-new-filings` Job):** Queries SEC API for recent filings, checks against BQ `filing_metadata` for existing records, inserts *new* metadata directly into BQ `filing_metadata`. Passes details of new filings to the workflow.
+    * **Step 2 (`download-filing-pdf` Job - per new filing):** Takes filing details (from Step 1), downloads the PDF via `sec-api` filing link, uploads PDF (named e.g., `Ticker_AccesnsionNumber.pdf`) to GCS (`GCS_PDF_FOLDER`). Passes PDF GCS path to the workflow.
+    * **Step 3 (Run in Parallel - per new filing):**
+        * **Step 3a (`generate-qualitative-analysis` Job):** Takes PDF path (from Step 2) & filing details, downloads PDF, uses Gemini File API for qualitative analysis, saves result TXT (e.g., `Ticker_AccesnsionNumber_analysis.txt`) to GCS (`GCS_QUALITATIVE_TXT_PREFIX`). Saves analysis metadata (e.g., `Ticker_AccesnsionNumber_metadata.csv`) to GCS (`GCS_METADATA_CSV_PREFIX`).
+        * **Step 3b (`generate-headline-assessment` Job):** Takes filing details (from Step 1), uses Vertex AI Gemini + Search Tool for recent news analysis (e.g., 14-day lookback), saves result TXT (e.g., `RiskAssessment_Ticker_YYYYMMDD.txt`) to GCS (`GCS_NEWS_SUMMARY_PREFIX`).
+    * Workflow manages the execution and potential retries of these jobs.
+2.  **Batch Processing (Scheduled):**
+    * **`price-loader-job`:** Triggered by Cloud Scheduler (e.g., M-F 4 PM). Queries BQ `filing_metadata` for tickers, fetches incremental daily prices from `yfinance`, appends to BQ `price_data` table.
+    * **`ratio-calculator-job`:** Triggered by Cloud Scheduler (e.g., M-F 4:30 PM). Queries BQ (`filing_metadata`, `financial_ratios`) for unprocessed filings (based on metadata added by Step 1 but not yet in ratios table), fetches required BQ data (including prices updated by `price-loader-job`), uses Gemini API for calculations, appends results to BQ `financial_ratios` table. *(Ensures it only calculates for new/missing filings)*.
 
-## Project Structure
+## Project Structure (v2)
 
-This project uses a monorepo structure:
+This project uses a monorepo structure, transitioning to job-focused components:
 
 ```
 profit_scout_pipeline/
 |
-├── services/                    # Code for individual microservices
-│   ├── listener/                # WebSocket listener -> Pub/Sub publisher
+├── jobs/                   # Code for individual Cloud Run Jobs
+│   ├── fetch_filings/      # Scheduled via Workflow: SEC API -> BQ Metadata Check -> BQ Metadata Insert
 │   │   ├── src/
 │   │   ├── Dockerfile
-│   │   └── requirements.in / .txt
-│   ├── subscriber/              # Pub/Sub -> BQ (Financials, Metadata), GCS (PDF)
-│   │   ├── src/                 # subscriber.py, main.py
+│   │   └── requirements.txt
+│   ├── download_pdf/       # Triggered by Workflow: Filing Link -> GCS PDF
+│   │   ├── src/
 │   │   ├── Dockerfile
-│   │   └── requirements.in / .txt
-│   ├── price_loader/            # Scheduled Job: yfinance -> BQ (Prices)
-│   │   ├── src/                 # price_loader.py
+│   │   └── requirements.txt
+│   ├── generate_qualitative_analysis/ # Triggered by Workflow: GCS PDF -> Gemini -> GCS TXT/CSV
+│   │   ├── src/
 │   │   ├── Dockerfile
-│   │   └── requirements.in / .txt
-│   ├── ratio_calculator/        # Scheduled Job: BQ -> Gemini -> BQ (Ratios)
-│   │   ├── src/                 # ratio_calculator.py
+│   │   └── requirements.txt
+│   ├── generate_headline_assessment/ # Triggered by Workflow: Filing Details -> Vertex AI -> GCS TXT
+│   │   ├── src/
 │   │   ├── Dockerfile
-│   │   └── requirements.in / .txt
-│   ├── pdf_summarizer/          # Eventarc (GCS PDF) -> Gemini -> GCS (TXT Summary)
-│   │   ├── src/                 # pdf_summarizer.py, main.py
+│   │   └── requirements.txt
+│   ├── price_loader/       # Scheduled Job: yfinance -> BQ Prices
+│   │   ├── src/
 │   │   ├── Dockerfile
-│   │   └── requirements.in / .txt
-│   └── news_summarizer/         # Eventarc (GCS PDF) -> BQ -> Vertex AI -> GCS (TXT Summary)
-│       ├── src/                 # news_summarizer.py, main.py
+│   │   └── requirements.txt
+│   └── ratio_calculator/   # Scheduled Job: BQ -> Gemini -> BQ Ratios
+│       ├── src/
 │       ├── Dockerfile
-│       └── requirements.in / .txt
+│       └── requirements.txt
 │
-├── infrastructure/              # Infrastructure as Code (Terraform)
+├── infrastructure/         # Infrastructure as Code (Terraform)
 │   └── terraform/
-│       ├── main.tf              # Defines GCP resources (BQ, GCS, PubSub, Secrets, Run, Eventarc, etc.)
-│       ├── variables.tf
-│       └── ...                  # modules/, envs/, etc.
+│       ├── main.tf         # Core resources (APIs, BQ, GCS, Secrets, Artifact Registry)
+│       ├── iam.tf          # Service Accounts & IAM Bindings
+│       ├── cloudrun_jobs.tf # Cloud Run Job definitions
+│       ├── scheduling.tf   # Cloud Scheduler job definitions
+│       ├── workflow.tf     # Cloud Workflow definition
+│       └── variables.tf
 │
-├── cicd/                        # CI/CD Pipeline Definitions
-│   └── cloudbuild.yaml          # Cloud Build: Builds service images, pushes to Artifact Registry
+├── cicd/                   # CI/CD Pipeline Definitions
+│   └── cloudbuild.yaml     # Cloud Build: Builds job images, pushes to Artifact Registry
 │
-├── tests/                       # Automated Tests
+├── tests/                  # Automated Tests (To be developed)
 │   ├── unit/
 │   └── integration/
 │
 ├── .gitignore
-├── README.md                    # This file
-└── .env.example                 # Template for local development environment variables
-
+├── README.md               # This file
+└── .env.example            # Template for local development environment variables
 ```
-## Components Deep Dive
+## Components Deep Dive (v2)
 
-*(This section provides a high-level overview. More details are in the source code.)*
+*(This section provides a high-level overview. More details are in the source code for each job.)*
 
-### 1. Listener (`services/listener/`)
-* **Purpose:** Ingest real-time SEC filing notifications.
-* **Trigger:** External WebSocket stream (`sec-api.io`).
-* **Function:** Connects securely, handles reconnections, filters 10-K/Q, publishes details (`ticker`, `accession_no`, `form_type`, `filing_url`, `filed_at`) to Pub/Sub.
-* **Output:** Pub/Sub messages.
-* **Deployment:** Cloud Run Service (long-running, potentially min_instances=1).
+### 1. Fetch New Filings (`jobs/fetch_filings/`)
+* **Purpose:** Identify and record metadata for newly filed 10-Ks/10-Qs.
+* **Trigger:** Cloud Workflow (initiated by Cloud Scheduler, e.g., M-F 6 AM).
+* **Function:** Queries SEC API for recent filings (e.g., last 24h). Compares `AccessionNumber` against BQ `filing_metadata`. Inserts metadata for *new* filings into BQ. Outputs list of new filing details for the workflow.
+* **Output:** BQ rows (`filing_metadata`), Workflow variables (list of new filings).
+* **Deployment:** Cloud Run Job.
 
-### 2. Subscriber (`services/subscriber/`)
-* **Purpose:** Process core filing data upon notification.
-* **Trigger:** Pub/Sub topic subscription (push).
-* **Function:** Consumes message, fetches XBRL data & PDF, parses financials, cleans accession number (removes hyphens), writes financials to BQ (`balance_sheet`, `income_statement`, `cash_flow`) using cleaned AN, writes metadata to BQ (`filing_metadata`) using cleaned AN, uploads PDF to GCS (named `Ticker_AccesnsionNumber.pdf`) without GCS metadata.
-* **Output:** BQ table rows, GCS PDF object.
-* **Deployment:** Cloud Run Service.
+### 2. Download Filing PDF (`jobs/download_pdf/`)
+* **Purpose:** Download the official PDF for a specific new filing.
+* **Trigger:** Cloud Workflow (for each new filing identified by Job 1).
+* **Function:** Receives filing details (including `LinkToFilingDetails`). Checks GCS for existing PDF. If missing, downloads PDF via `sec-api` filing link, uploads to GCS (`GCS_PDF_FOLDER`).
+* **Output:** GCS PDF object (or path for workflow).
+* **Deployment:** Cloud Run Job.
 
-### 3. Price Loader (`services/price_loader/`)
+### 3. Generate Qualitative Analysis (`jobs/generate_qualitative_analysis/`)
+* **Purpose:** Generate qualitative analysis directly from the filing PDF using Gemini.
+* **Trigger:** Cloud Workflow (for each new filing PDF from Job 2).
+* **Function:** Receives PDF GCS path and filing details. Checks for existing analysis TXT. Downloads PDF, uploads to Gemini File API, calls Gemini model with prompt, saves text summary to GCS (`GCS_ANALYSIS_TXT_PREFIX`) and metadata to GCS (`GCS_METADATA_CSV_PREFIX`).
+* **Output:** GCS TXT object, GCS CSV object.
+* **Deployment:** Cloud Run Job.
+
+### 4. Generate Headline Assessment (`jobs/generate_headline_assessment/`)
+* **Purpose:** Generate summary/assessment based on recent news around the filing date using Vertex AI.
+* **Trigger:** Cloud Workflow (for each new filing identified by Job 1).
+* **Function:** Receives filing details. Checks for existing assessment TXT. Calls Vertex AI Gemini model with Search Tool enabled. Saves text summary to GCS (`GCS_NEWS_SUMMARY_PREFIX`).
+* **Output:** GCS TXT object.
+* **Deployment:** Cloud Run Job.
+
+### 5. Price Loader (`jobs/price_loader/`)
 * **Purpose:** Maintain daily stock price history.
-* **Trigger:** Cloud Scheduler (time-based).
-* **Function:** Queries BQ `filing_metadata` for distinct tickers, fetches incremental daily prices from `yfinance` based on `MAX(date)` in `price_data`, appends new data to BQ `price_data` table. Handles initial load.
+* **Trigger:** Cloud Scheduler (time-based, e.g., M-F 4 PM).
+* **Function:** Queries BQ `filing_metadata` for distinct tickers, fetches incremental daily prices from `yfinance` based on `MAX(date)` in `price_data`, appends new data to BQ `price_data` table.
 * **Output:** BQ table rows (`price_data`).
 * **Deployment:** Cloud Run Job.
 
-### 4. Ratio Calculator (`services/ratio_calculator/`)
-* **Purpose:** Calculate financial ratios based on processed filings.
-* **Trigger:** Cloud Scheduler (time-based).
-* **Function:** Queries BQ to find filings in `filing_metadata` missing from `financial_ratios`. Fetches required financials/prices from BQ, calculates price trend, calls Gemini API for other ratio calculations, appends results to BQ `financial_ratios` table. Uses threading for concurrency.
+### 6. Ratio Calculator (`jobs/ratio_calculator/`)
+* **Purpose:** Calculate financial ratios based on processed filings and prices.
+* **Trigger:** Cloud Scheduler (time-based, e.g., M-F 4:30 PM, after price_loader).
+* **Function:** Queries BQ to find filings in `filing_metadata` missing from `financial_ratios`. Fetches required financials/prices from BQ, calls Gemini API for ratio calculations (if needed), appends results to BQ `financial_ratios` table. *(Script modified to append, not replace)*.
 * **Output:** BQ table rows (`financial_ratios`).
 * **Deployment:** Cloud Run Job.
-
-### 5. PDF Summarizer (`services/pdf_summarizer/`)
-* **Purpose:** Generate qualitative analysis directly from the filing PDF.
-* **Trigger:** Eventarc (GCS PDF object creation in `GCS_PDF_FOLDER`).
-* **Function:** Parses filename for ticker/AN(cleaned). Downloads PDF, uploads to Gemini File API, calls Gemini model with prompt, saves text summary (`Ticker_AccesnsionNumber.txt`) with basic metadata to GCS (`GCS_ANALYSIS_TXT_PREFIX`).
-* **Output:** GCS TXT object.
-* **Deployment:** Cloud Run Service.
-
-### 6. News Summarizer (`services/news_summarizer/`)
-* **Purpose:** Generate summary/assessment based on recent news around the filing date.
-* **Trigger:** Eventarc (GCS PDF object creation in `GCS_PDF_FOLDER`).
-* **Function:** Parses filename for ticker/AN(cleaned). Queries BQ `filing_metadata` for filing date. Calls Vertex AI Gemini model with Search Tool enabled (30-day lookback). Saves text summary (`Ticker_AccesnsionNumber.txt`) to GCS (`GCS_NEWS_SUMMARY_PREFIX`).
-* **Output:** GCS TXT object.
-* **Deployment:** Cloud Run Service.
 
 ## Setup & Configuration
 
@@ -132,113 +131,121 @@ profit_scout_pipeline/
 
 * Python 3 (e.g., 3.11+)
 * Google Cloud Platform (GCP) Project (e.g., `profit-scout-456416`)
-* Enabled GCP APIs: Cloud Run, Cloud Build, Artifact Registry, Secret Manager, BigQuery API, Cloud Storage API, Pub/Sub, Eventarc, Cloud Scheduler, IAM, Vertex AI API.
+* Enabled GCP APIs: Cloud Run, Cloud Build, Artifact Registry, Secret Manager, BigQuery API, Cloud Storage API, Cloud Scheduler, IAM, Vertex AI API, **Cloud Workflows API**.
 * Terraform CLI (for infrastructure provisioning).
 * `gcloud` CLI configured locally or use Cloud Shell.
 * `sec-api.io` Account and API Key.
-* Gemini API Key (if using direct Gemini API for `ratio_calculator`/`pdf_summarizer`).
+* Gemini API Key (if using direct Gemini API for `generate-qualitative-analysis` or `ratio_calculator`).
 
 ### IAM / Service Accounts
 
-It is recommended to create dedicated service accounts via Terraform for each distinct service or job with the principle of least privilege. Key roles needed across different services include:
-* `roles/run.invoker`
-* `roles/pubsub.publisher` / `roles/pubsub.subscriber`
+Create dedicated service accounts via Terraform for each distinct job with the principle of least privilege. Key roles needed include:
+* `roles/run.invoker` (for Scheduler/Workflow to trigger jobs)
 * `roles/secretmanager.secretAccessor`
-* `roles/bigquery.dataEditor` / `roles/bigquery.jobUser` / `roles/bigquery.dataViewer`
-* `roles/storage.objectAdmin` / `roles/storage.objectCreator` / `roles/storage.objectViewer`
+* `roles/bigquery.dataEditor` / `roles/bigquery.jobUser`
+* `roles/storage.objectAdmin`
 * `roles/logging.logWriter`
-* `roles/eventarc.eventReceiver`
-* `roles/aiplatform.user` (for Vertex AI endpoint usage)
-* `roles/iam.serviceAccountUser` (for services/triggers acting as other service accounts)
-*(Specific bindings should be defined in Terraform)*
+* `roles/aiplatform.user` (for Vertex AI endpoint usage in `generate-headline-assessment`)
+* `roles/workflows.invoker` (for Scheduler to trigger workflow)
+* `roles/iam.serviceAccountUser` (for Workflow/Scheduler acting as other SAs)
+*(Specific bindings defined in Terraform)*
 
 ### Secrets
 
 Store sensitive keys in **Google Secret Manager**:
-1.  **SEC API Key:** Used by `listener` and `subscriber`.
+1.  **SEC API Key:** Used by `fetch-new-filings` and `download-filing-pdf`.
     * Secret Name Example: `sec-api-key`
     * Accessed via env var: `SEC_API_SECRET_ID`
-2.  **Gemini API Key:** Used by `ratio_calculator` and `pdf_summarizer` (if using direct Gemini API).
+2.  **Gemini API Key:** Used by `generate-qualitative-analysis` and `ratio_calculator` (if using direct Gemini API).
     * Secret Name Example: `gemini-api-key`
     * Accessed via env var: `GEMINI_API_KEY_SECRET_ID`
 
 ### Environment Variables
 
-Configure these via the deployment mechanism (Terraform for Cloud Run Services/Jobs). Refer to `.env.example` for local development (use ADC locally, don't put secrets in `.env`).
+Configure these via Terraform when defining the Cloud Run Jobs and Workflow. Refer to `.env.example` for local development.
 
-*(List ALL required environment variables identified across all services - ensure this list is complete and matches code):*
+*(List environment variables required by the refactored Python job scripts):*
 * `GCP_PROJECT_ID`
-* `GCP_REGION` (e.g., `us-central1` - for Vertex AI client)
-* `BQ_DATASET_ID` (e.g., `profit_scout`)
-* `BQ_METADATA_TABLE_ID` (e.g., `filing_metadata`)
-* `BQ_FINANCIALS_BS_TABLE_ID` (e.g., `balance_sheet`)
-* `BQ_FINANCIALS_IS_TABLE_ID` (e.g., `income_statement`)
-* `BQ_FINANCIALS_CF_TABLE_ID` (e.g., `cash_flow`)
-* `BQ_PRICE_TABLE_ID` (e.g., `price_data`)
-* `BQ_RATIOS_TABLE_ID` (e.g., `financial_ratios`)
+* `GCP_REGION` (e.g., `us-central1`)
+* `BQ_DATASET_ID`
+* `BQ_METADATA_TABLE_ID`
+* `BQ_FINANCIALS_BS_TABLE_ID` (Used by ratio_calculator)
+* `BQ_FINANCIALS_IS_TABLE_ID` (Used by ratio_calculator)
+* `BQ_FINANCIALS_CF_TABLE_ID` (Used by ratio_calculator)
+* `BQ_PRICE_TABLE_ID` (Used by price_loader, ratio_calculator)
+* `BQ_RATIOS_TABLE_ID`
 * `GCS_BUCKET_NAME`
-* `GCS_PDF_FOLDER` (Input for summarizers, output for subscriber)
-* `GCS_ANALYSIS_TXT_PREFIX` (Output for pdf_summarizer)
-* `GCS_NEWS_SUMMARY_PREFIX` (Output for news_summarizer)
+* `GCS_PDF_FOLDER` (Output for download_pdf, input for generate_qualitative_analysis)
+* `GCS_QUALITATIVE_TXT_PREFIX` (Output for generate_qualitative_analysis)
+* `GCS_METADATA_CSV_PREFIX` (Output for generate_qualitative_analysis)
+* `GCS_NEWS_SUMMARY_PREFIX` (Output for generate_headline_assessment, uses this name in code)
 * `SEC_API_SECRET_ID`
 * `SEC_API_SECRET_VERSION`
-* `SEC_WEBSOCKET_URL`
 * `GEMINI_API_KEY_SECRET_ID`
 * `GEMINI_API_KEY_SECRET_VERSION`
-* `GEMINI_MODEL_NAME` (e.g., `gemini-2.0-flash-001` or Vertex model ID)
-* `MAX_WORKERS` (Optional, for threaded batch jobs)
-* `PUB_SUB_TOPIC_ID` (Used by listener to publish, e.g., `sec-filing-notification`)
-* `PORT` (Optional, defaults to 8080 for Cloud Run services)
+* `GEMINI_MODEL_NAME` (Model ID for Gemini/Vertex)
+* `LOOKBACK_HOURS` (For fetch-new-filings)
+* `FILING_TYPES` (For fetch-new-filings)
+* `MAX_WORKERS` (Optional, for threaded jobs like ratio_calculator)
+* `PORT` (Optional, less relevant for jobs, but Cloud Run default is 8080 if ever needed)
+* *(Potentially others depending on exact refactoring)*
 
 ### GCP Resource Setup (via Terraform)
 
 The `infrastructure/terraform/` directory contains the definitions for all necessary GCP resources. This includes creating/managing:
 * GCS Bucket
-* BigQuery Dataset (`profit_scout`)
-* BigQuery Tables (schemas defined in TF): `filing_metadata`, `balance_sheet`(import), `income_statement`(import), `cash_flow`(import), `price_data`(import), `financial_ratios`(create)
-* Pub/Sub Topic (`sec-filing-notification`) & Subscription (`subscriber-sub`)
+* BigQuery Dataset & Tables
 * Secret Manager Secret definitions
-* Artifact Registry Docker Repository (`profit-scout-repo`)
+* Artifact Registry Docker Repository
 * IAM Service Accounts and Bindings
-* Cloud Run Services & Jobs (definitions referencing images built by Cloud Build)
-* Eventarc Triggers (GCS -> pdf_summarizer, GCS -> news_summarizer)
-* Cloud Scheduler Jobs (Triggering price_loader, ratio_calculator)
+* **Cloud Run Job definitions** (referencing images built by Cloud Build)
+* **Cloud Workflow definition**
+* **Cloud Scheduler Jobs** (Triggering the main Workflow, price_loader, ratio_calculator)
 
-Run `terraform init`, `terraform plan`, and `terraform apply` within `infrastructure/terraform/` to provision/update resources. Use `terraform import` for existing BQ tables.
+Run `terraform init`, `terraform plan`, and `terraform apply` within `infrastructure/terraform/` to provision/update resources.
 
 ## Local Development Setup
 
-1.  Clone the repository from Cloud Source Repositories.
+1.  Clone the repository.
 2.  Ensure Python 3.11+ and `pip` are installed.
 3.  Set up Application Default Credentials (ADC): `gcloud auth application-default login`.
 4.  Install `pip-tools`: `pip install pip-tools`.
-5.  Install dependencies *per service*:
+5.  Install dependencies *per job*:
     ```bash
-    cd services/listener
-    pip-compile --generate-hashes requirements.in # Only if requirements.in changed
-    pip install --require-hashes -r requirements.txt
-    cd ../subscriber
-    pip-compile --generate-hashes requirements.in # Only if requirements.in changed
-    pip install --require-hashes -r requirements.txt
-    # Repeat for price_loader, ratio_calculator, pdf_summarizer, news_summarizer...
+    cd jobs/fetch_filings
+    # pip-compile --generate-hashes requirements.in # Optional
+    pip install -r requirements.txt
+    cd ../download_pdf
+    # pip-compile --generate-hashes requirements.in # Optional
+    pip install -r requirements.txt
+    # Repeat for other jobs...
     cd ../.. # Back to root
     ```
-6.  Copy `.env.example` to `.env` in the root directory.
-7.  Fill in necessary **non-secret** values in `.env` (like `GCP_PROJECT_ID`, table names if different from defaults). The Python scripts load these using `os.getenv()`. Secrets (`SEC_API_SECRET_ID`, `GEMINI_API_KEY_SECRET_ID`) point to names in Secret Manager, accessed via ADC.
-8.  Run individual services locally if needed (ensure required services like Pub/Sub emulator or BQ are accessible or mocked):
-    * Batch Jobs: `python services/price_loader/src/price_loader.py` / `python services/ratio_calculator/src/ratio_calculator.py`
-    * Web Services: `python services/subscriber/src/main.py` / `python services/pdf_summarizer/src/main.py` / `python services/news_summarizer/src/main.py` (uses Flask dev server)
-    * Listener: `python services/listener/src/listener.py`
+6.  Copy `.env.example` to `.env`. Fill in **non-secret** values. Secrets are referenced by name (`*_SECRET_ID`) and fetched via ADC.
+7.  Run individual jobs locally (requires setting appropriate environment variables, secrets accessible via ADC):
+    ```bash
+    # Example for fetch-filings job
+    export GCP_PROJECT_ID="profit-scout-456416"
+    export BQ_DATASET_ID="profit_scout"
+    # ... set other env vars ...
+    python jobs/fetch_filings/src/main.py
+
+    # Example for ratio calculator
+    export GCP_PROJECT_ID="profit-scout-456416"
+    # ... set other env vars ...
+    python jobs/ratio_calculator/src/ratio_calculator.py
+    ```
+    *(Note: Simulating the full workflow locally is complex; focus on testing individual job logic)*
 
 ## Building & Deploying
 
-1.  **Build Images:** Commit changes to Git. Cloud Build (configured via `cicd/cloudbuild.yaml` and potentially triggered by pushes to your Cloud Source Repository) will automatically build Docker images for each service and push them to Artifact Registry, tagged with the commit SHA. Manual build: `gcloud builds submit . --config=cicd/cloudbuild.yaml`.
-2.  **Deploy Infrastructure & Services:**
+1.  **Build Images:** Commit changes. Cloud Build (`cicd/cloudbuild.yaml`) builds Docker images for each job and pushes them to Artifact Registry (tagged, e.g., with commit SHA). Manual build: `gcloud builds submit . --config=cicd/cloudbuild.yaml`.
+2.  **Deploy Infrastructure & Jobs:**
     * Navigate to `infrastructure/terraform/`.
-    * Run `terraform init` (first time or after provider changes).
-    * Run `terraform plan -var="gcp_project_id=profit-scout-456416" -var="docker_image_tag=COMMIT_SHA"` (replace COMMIT_SHA with the tag built by Cloud Build, or use variable passing from Cloud Build). Review the plan.
-    * Run `terraform apply -var="gcp_project_id=profit-scout-456416" -var="docker_image_tag=COMMIT_SHA"` to create/update GCP resources and deploy/update the Cloud Run services/jobs to use the specified image tag.
+    * Run `terraform init`.
+    * Run `terraform plan -var="gcp_project_id=profit-scout-456416" -var="docker_image_tag=COMMIT_SHA"` (replace COMMIT_SHA). Review plan.
+    * Run `terraform apply -var="gcp_project_id=profit-scout-456416" -var="docker_image_tag=COMMIT_SHA"` to create/update GCP resources (Jobs, Workflow, Schedules, etc.).
 
 ## Dependencies
 
-Dependencies are managed *per service* using `requirements.in` (for direct dependencies) and `requirements.txt` (for pinned, resolved dependencies with hashes). Use `pip-compile --generate-hashes` within each service directory to update `requirements.txt` after modifying `requirements.in`. Install using `pip install --require-hashes -r requirements.txt`.
+Dependencies are managed *per job* using `requirements.txt` (pinned dependencies). Use `pip-tools` (`pip-compile`) optionally if using `requirements.in` for managing direct dependencies. Install using `pip install -r requirements.txt`.

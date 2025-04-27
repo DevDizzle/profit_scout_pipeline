@@ -1,0 +1,109 @@
+# cicd/cloudbuild.yaml - Google Cloud Build configuration (Revised Substitutions)
+# Builds Docker images for each job and pushes to Google Artifact Registry.
+
+substitutions:
+  # Use commit sha if available (e.g., from trigger), otherwise default to 'latest'
+  _TAG: ${COMMIT_SHA:-latest}
+  # Define defaults directly here, can be overridden by --substitutions if needed
+  _REGION: us-central1
+  _REPO_NAME: profit-scout-repo
+
+steps:
+  # --- Build Fetch Filings Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Fetch Filings'
+    dir: 'jobs/fetch_filings'
+    args:
+      - 'build'
+      - '-t'
+      # Use substitutions directly - $PROJECT_ID is automatically available
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/fetch-filings:${_TAG}'
+      - '-t' # Add latest tag as well
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/fetch-filings:latest'
+      - '.'
+    timeout: 1200s
+
+  # --- Build Download PDF Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Download PDF'
+    dir: 'jobs/download_pdf'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/download-pdf:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/download-pdf:latest'
+      - '.'
+    timeout: 1200s
+
+  # --- Build Qualitative Analysis Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Qualitative Analysis'
+    dir: 'jobs/generate_qualitative_analysis'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-qualitative-analysis:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-qualitative-analysis:latest'
+      - '.'
+    timeout: 1200s
+
+  # --- Build Headline Assessment Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Headline Assessment'
+    dir: 'jobs/generate_headline_assessment'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-headline-assessment:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-headline-assessment:latest'
+      - '.'
+    timeout: 1200s
+
+  # --- Build Price Loader Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Price Loader'
+    dir: 'jobs/price_loader'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/price-loader:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/price-loader:latest'
+      - '.'
+    timeout: 1200s
+
+  # --- Build Ratio Calculator Job ---
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Ratio Calculator'
+    dir: 'jobs/ratio_calculator'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/ratio-calculator:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/ratio-calculator:latest'
+      - '.'
+    timeout: 1200s
+
+# Images list defines which built images should be pushed to Artifact Registry
+# Ensure these match the -t arguments in the steps above
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/fetch-filings:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/fetch-filings:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/download-pdf:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/download-pdf:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-qualitative-analysis:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-qualitative-analysis:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-headline-assessment:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/generate-headline-assessment:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/price-loader:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/price-loader:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/ratio-calculator:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/ratio-calculator:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY # Default logging option
+  # machineType: 'E2_HIGHCPU_8' # Optional: Specify a larger machine type if builds are slow/complex

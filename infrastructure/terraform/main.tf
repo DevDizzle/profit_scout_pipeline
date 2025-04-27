@@ -1,108 +1,100 @@
 # infrastructure/terraform/main.tf
 
-# --- Enable Necessary GCP APIs ---
+# --- Enable GCP APIs ---
 resource "google_project_service" "required_apis" {
   project = var.gcp_project_id
 
+  # Ensure all necessary APIs are included
   for_each = toset([
-    "run.googleapis.com",
-    "cloudbuild.googleapis.com",
-    "artifactregistry.googleapis.com",
-    "secretmanager.googleapis.com",
-    "bigquery.googleapis.com",
-    "storage.googleapis.com",
-    "pubsub.googleapis.com",
-    "eventarc.googleapis.com",
-    "cloudscheduler.googleapis.com",
-    "iam.googleapis.com",
-    "aiplatform.googleapis.com",
-    "compute.googleapis.com"
+    # Core
+    "run.googleapis.com",                 # Cloud Run API (Services & Jobs)
+    "cloudbuild.googleapis.com",          # Cloud Build API
+    "artifactregistry.googleapis.com",    # Artifact Registry API
+    "secretmanager.googleapis.com",       # Secret Manager API
+    "bigquery.googleapis.com",            # BigQuery API
+    "storage.googleapis.com",             # Cloud Storage API
+    "iam.googleapis.com",                 # IAM API
+    "cloudscheduler.googleapis.com",      # Cloud Scheduler API
+    "aiplatform.googleapis.com",          # Vertex AI API (for headline_assessment)
+    "compute.googleapis.com",             # Often needed implicitly
+    # NEW: Workflow APIs
+    "workflows.googleapis.com",
+    "workflowexecutions.googleapis.com"
+    # REMOVED: "pubsub.googleapis.com" (unless needed elsewhere)
+    # REMOVED: "eventarc.googleapis.com"
   ])
 
   service                    = each.key
-  disable_dependent_services = false
-  disable_on_destroy         = false
-} # End of resource "google_project_service"
+  disable_dependent_services = false # Keep dependent services enabled
+  disable_on_destroy         = false # Keep APIs enabled even if Terraform destroys resources using them
+}
 
 # --- Artifact Registry Repository ---
 resource "google_artifact_registry_repository" "docker_repo" {
-  provider      = google # Or google-beta if specific features needed
   project       = var.gcp_project_id
-  location      = var.gcp_region
+  location      = var.gcp_region # Use regional repository
   repository_id = var.artifact_registry_repo_name
-  description   = "Docker repository for Profit Scout pipeline services"
+  description   = "Docker repository for Profit Scout pipeline jobs"
   format        = "DOCKER"
 
+  # Ensure APIs are enabled before creating repo
   depends_on = [
     google_project_service.required_apis["artifactregistry.googleapis.com"],
-    google_project_service.required_apis["cloudbuild.googleapis.com"]
   ]
-} # End of resource "google_artifact_registry_repository"
+}
 
 # --- Google Cloud Storage Bucket ---
 resource "google_storage_bucket" "main_bucket" {
   project                     = var.gcp_project_id
   name                        = var.gcs_bucket_name
-  location                    = "US-CENTRAL1" # Corrected Location
-  force_destroy               = false
+  location                    = var.gcp_location # Use location variable (e.g., "US")
+  force_destroy               = false # Set to true only for non-production cleanup
   uniform_bucket_level_access = true
 
-  lifecycle_rule {
-    action { type = "AbortIncompleteMultipartUpload" }
-    condition { age = 1 }
-  }
-  # versioning { enabled = true } # Optional
+  # Optional: Add lifecycle rules, versioning, etc. as needed
+  # lifecycle_rule {
+  #   action { type = "Delete" }
+  #   condition { age = 30 } # Example: delete objects older than 30 days
+  # }
 
-  depends_on = [ google_project_service.required_apis["storage.googleapis.com"] ]
-
-  # NOTE: Run 'terraform import google_storage_bucket.main_bucket profit-scout'
-} # End of resource "google_storage_bucket"
+  depends_on = [google_project_service.required_apis["storage.googleapis.com"]]
+}
 
 # --- BigQuery Dataset ---
 resource "google_bigquery_dataset" "profit_scout_dataset" {
   project     = var.gcp_project_id
   dataset_id  = var.bq_dataset_id
-  location    = "US"              # Verified Location
+  location    = var.gcp_location
   description = "Dataset for Profit Scout pipeline data"
 
-  depends_on = [ google_project_service.required_apis["bigquery.googleapis.com"] ]
+  depends_on = [google_project_service.required_apis["bigquery.googleapis.com"]]
+}
 
-  # NOTE: Run 'terraform import google_bigquery_dataset.profit_scout_dataset profit-scout-456416/profit_scout'
-} # End of resource "google_bigquery_dataset"
+# --- REMOVED: Pub/Sub Topic ---
+# The google_pubsub_topic.filing_notifications resource is removed
+# as the workflow orchestration replaces the Pub/Sub notification mechanism.
 
-# --- Pub/Sub Topic ---
-resource "google_pubsub_topic" "filing_notifications" {
-  project = var.gcp_project_id
-  name    = var.pubsub_topic_id
-
-  depends_on = [ google_project_service.required_apis["pubsub.googleapis.com"] ]
-
-  # NOTE: Run 'terraform import google_pubsub_topic.filing_notifications projects/profit-scout-456416/topics/sec-filing-notification'
-} # End of resource "google_pubsub_topic"
-
-# --- Secret Manager Secrets (Definitions only) ---
+# --- Secret Manager Secrets ---
+# Define the secrets (versions are managed outside Terraform or assumed 'latest')
 resource "google_secret_manager_secret" "sec_api_key_secret" {
   project   = var.gcp_project_id
-  secret_id = var.sec_api_secret_name # Should be "sec-api-key"
+  secret_id = var.sec_api_secret_name
 
   replication {
-    auto {} # Correct syntax for automatic replication
+    auto {}
   }
+  # Optional: Add labels, expiration, etc.
 
-  depends_on = [ google_project_service.required_apis["secretmanager.googleapis.com"] ]
-
-  # NOTE: Run 'terraform import google_secret_manager_secret.sec_api_key_secret projects/profit-scout-456416/secrets/sec-api-key'
-} # End of resource "google_secret_manager_secret" sec_api_key_secret
+  depends_on = [google_project_service.required_apis["secretmanager.googleapis.com"]]
+}
 
 resource "google_secret_manager_secret" "gemini_api_key_secret" {
   project   = var.gcp_project_id
-  secret_id = var.gemini_api_secret_name 
+  secret_id = var.gemini_api_secret_name
 
   replication {
-    auto {} 
+    auto {}
   }
 
-  depends_on = [ google_project_service.required_apis["secretmanager.googleapis.com"] ]
-
-  # NOTE: Run 'terraform import google_secret_manager_secret.gemini_api_key_secret projects/profit-scout-456416/secrets/gemini-api-key'
-} # End of resource "google_secret_manager_secret" gemini_api_key_secret
+  depends_on = [google_project_service.required_apis["secretmanager.googleapis.com"]]
+}
