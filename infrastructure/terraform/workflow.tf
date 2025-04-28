@@ -7,46 +7,53 @@ resource "google_workflows_workflow" "main_workflow" {
   description     = "Orchestrates the daily SEC filing processing pipeline."
   service_account = google_service_account.workflow_sa.email
 
-  # Workflow definition in YAML. Expressions are escaped ($$).
-  # Simple expressions (variable access, basic functions) used for assignments, conditions, loops, or simple args are NOT quoted.
-  # Complex expressions (internal strings, concatenation, ternary) used for env vars or complex args ARE quoted ('$${{...}}').
+  # Workflow definition in YAML. Expressions use $${} to escape Terraform interpolation.
+  # Simple expressions (variable access, basic functions) are NOT quoted.
+  # Complex expressions (concatenation, etc.) used for args ARE quoted ('$${...}').
   source_contents = <<-YAML
 main:
-  params: [project_id, location, fetch_job_id, download_job_id, qual_analysis_job_id, headline_job_id, event]
+  params: [input]
   steps:
   - init:
       assign:
         - new_filings: []
         - all_errors: []
+      next: initFetchJob
+
+  - initFetchJob:
+      assign:
+        - fetch_job_failed: false
       next: callFetchFilingsJob
 
   - callFetchFilingsJob:
       try:
         call: googleapis.run.v2.projects.locations.jobs.run
         args:
-          name: $${{fetch_job_id}}
+          name: $${input.fetch_job_id}
         result: fetch_result
       except:
+        as: error
         assign:
-          - fetch_job_error: $${{last_error}}
-        next: recordErrorAndFail
+          - fetch_job_error: $${error}
+          - fetch_job_failed: true
+      next: checkFetchJobResult
+
+  - checkFetchJobResult:
+      switch:
+        - condition: $${fetch_job_failed}
+          next: recordErrorAndFail
       next: decodeFetchResult
 
   - decodeFetchResult:
-      try:
-        assign:
-          - decoded_output: $${{json.decode(fetch_result.body)}}
-          - new_filings: $${{decoded_output.new_filing_details}}
-          - processed_count: $${{decoded_output.newly_processed_count}}
-      except:
-        assign:
-          - decode_error: "Failed to decode fetch job output."
-        next: recordErrorAndFail
+      assign:
+        - decoded_output: $${json.decode(fetch_result.body)}
+        - new_filings: $${decoded_output.new_filing_details}
+        - processed_count: $${decoded_output.newly_processed_count}
       next: checkNewFilingsList
 
   - checkNewFilingsList:
       switch:
-        - condition: $${{len(new_filings) > 0}}
+        - condition: $${len(new_filings) > 0}
           next: processFilingsLoop
       next: noNewFilings
 
@@ -60,110 +67,145 @@ main:
   - processFilingsLoop:
       for:
         value: current_filing
-        in: $${{new_filings}}
+        in: $${new_filings}
         steps:
+          - initDownload:
+              assign:
+                - download_failed: false
+              next: callDownloadPDF
+
           - callDownloadPDF:
               try:
                 call: googleapis.run.v2.projects.locations.jobs.run
                 args:
-                  name: $${{download_job_id}}
-                  overrides:
-                    containerOverrides:
-                      - env:
-                          - name: INPUT_TICKER
-                            value: $${{current_filing.Ticker}}
-                          - name: INPUT_ACCESSION_NUMBER
-                            value: $${{current_filing.AccessionNumber}}
-                          - name: INPUT_FILING_URL
-                            value: $${{current_filing.LinkToFilingDetails}}
+                  name: $${input.download_job_id}
+                  body:
+                    overrides:
+                      containerOverrides:
+                        - env:
+                            - name: INPUT_TICKER
+                              value: $${current_filing.Ticker}
+                            - name: INPUT_ACCESSION_NUMBER
+                              value: $${current_filing.AccessionNumber}
+                            - name: INPUT_FILING_URL
+                              value: $${current_filing.LinkToFilingDetails}
                 result: download_result
               except:
                 assign:
-                  - all_errors: $${{list.concat(all_errors, ["Download failed for " + current_filing.Ticker])}}
-                next: endIteration
+                  - all_errors: $${list.concat(all_errors, ["Download failed for " + current_filing.Ticker])}
+                  - download_failed: true
+              next: checkDownloadResult
+
+          - checkDownloadResult:
+              switch:
+                - condition: $${download_failed}
+                  next: endIteration
               next: decodeDownloadResult
 
           - decodeDownloadResult:
-              try:
-                assign:
-                  - decoded_download: $${{json.decode(download_result.body)}}
-                  - pdf_gcs_path: $${{decoded_download.output_gcs_path}}
-              except:
-                assign:
-                  - all_errors: $${{list.concat(all_errors, ["Decode failed for " + current_filing.Ticker])}}
-                next: endIteration
+              assign:
+                - decoded_download: $${json.decode(download_result.body)}
+                - pdf_gcs_path: $${decoded_download.output_gcs_path}
               next: checkPdfPath
 
           - checkPdfPath:
               switch:
-                - condition: $${{pdf_gcs_path != null}}
-                  next: parallelAnalysisSteps
+                - condition: $${pdf_gcs_path != null}
+                  next: setCompanyName
+                - condition: true
+                  assign:
+                    - all_errors: $${list.concat(all_errors, ["Missing PDF for " + current_filing.Ticker])}
+                  next: endIteration
+
+          - setCompanyName:
+              switch:
+                - condition: $${"CompanyName" in current_filing}
+                  assign:
+                    - company_name: $${current_filing.CompanyName}
+                - condition: true
+                  assign:
+                    - company_name: $${current_filing.Ticker}
+              next: initParallel
+
+          - initParallel:
               assign:
-                - all_errors: $${{list.concat(all_errors, ["Missing PDF for " + current_filing.Ticker])}}
-              next: endIteration
+                - qual_job_id: $${input.qual_analysis_job_id}
+                - headline_job_id: $${input.headline_job_id}
+              next: parallelAnalysisSteps
 
           - parallelAnalysisSteps:
               parallel:
-                shared: [current_filing, pdf_gcs_path, qual_analysis_job_id, headline_job_id]
+                shared: [current_filing, pdf_gcs_path, qual_job_id, headline_job_id, company_name]
                 branches:
                   - qualitative_branch:
                       steps:
                         - callQualitativeAnalysis:
                             call: googleapis.run.v2.projects.locations.jobs.run
                             args:
-                              name: $${{qual_analysis_job_id}}
-                              overrides:
-                                containerOverrides:
-                                  - env:
-                                      - name: INPUT_TICKER
-                                        value: $${{current_filing.Ticker}}
-                                      - name: INPUT_ACCESSION_NUMBER
-                                        value: $${{current_filing.AccessionNumber}}
-                                      - name: INPUT_FILING_DATE
-                                        value: $${{current_filing.FiledDate}}
-                                      - name: INPUT_FORM_TYPE
-                                        value: $${{current_filing.FormType}}
-                                      - name: INPUT_PDF_GCS_PATH
-                                        value: $${{pdf_gcs_path}}
+                              name: $${qual_job_id}
+                              body:
+                                overrides:
+                                  containerOverrides:
+                                    - env:
+                                        - name: INPUT_TICKER
+                                          value: $${current_filing.Ticker}
+                                        - name: INPUT_ACCESSION_NUMBER
+                                          value: $${current_filing.AccessionNumber}
+                                        - name: INPUT_FILING_DATE
+                                          value: $${current_filing.FiledDate}
+                                        - name: INPUT_FORM_TYPE
+                                          value: $${current_filing.FormType}
+                                        - name: INPUT_PDF_GCS_PATH
+                                          value: $${pdf_gcs_path}
 
                   - headline_branch:
                       steps:
                         - callHeadlineAssessment:
                             call: googleapis.run.v2.projects.locations.jobs.run
                             args:
-                              name: $${{headline_job_id}}
-                              overrides:
-                                containerOverrides:
-                                  - env:
-                                      - name: INPUT_TICKER
-                                        value: $${{current_filing.Ticker}}
-                                      - name: INPUT_FILING_DATE
-                                        value: $${{current_filing.FiledDate}}
-                                      - name: INPUT_COMPANY_NAME
-                                        value: '$${{"CompanyName" in current_filing ? current_filing.CompanyName : current_filing.Ticker}}'
+                              name: $${headline_job_id}
+                              body:
+                                overrides:
+                                  containerOverrides:
+                                    - env:
+                                        - name: INPUT_TICKER
+                                          value: $${current_filing.Ticker}
+                                        - name: INPUT_FILING_DATE
+                                          value: $${current_filing.FiledDate}
+                                        - name: INPUT_COMPANY_NAME
+                                          value: $${company_name}
               next: endIteration
 
           - endIteration:
               assign:
                 - loop_iteration_complete: true
-      next: logCompletion
+      next: setLogSeverity
 
   - recordErrorAndFail:
       assign:
-        - all_errors: $${{list.concat(all_errors, ["Critical error in workflow."])}}
+        - all_errors: $${list.concat(all_errors, ["Critical error in workflow."])}
+      next: setLogSeverity
+
+  - setLogSeverity:
+      switch:
+        - condition: $${len(all_errors) > 0}
+          assign:
+            - log_severity: "WARNING"
+        - condition: true
+          assign:
+            - log_severity: "INFO"
       next: logCompletion
 
   - logCompletion:
       call: sys.log
       args:
-        # Complex expressions for args seem to require quoting
-        text: '$${{"Workflow completed. Errors: " + string(len(all_errors))}}'
-        severity: '$${{len(all_errors) > 0 ? "WARNING" : "INFO"}}' # <<< FIX: Added quotes here
+        text: '$${"Workflow completed. Errors: " + string(len(all_errors))}'
+        severity: $${log_severity}
       next: decideResult
 
   - decideResult:
       switch:
-        - condition: $${{len(all_errors) > 0}}
+        - condition: $${len(all_errors) > 0}
           next: returnFailure
       next: returnSuccess
 
