@@ -1,18 +1,24 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim
+# Dockerfile
+FROM python:3.11
 
-# Set the working directory in the container
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libc-dev \
+    libstdc++6 \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy the requirements file into the container
+# Copy requirements and install with verbose output
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -v -r requirements.txt && \
+    pip list
 
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the rest of the application code into the container
+# Copy application code
 COPY src/ .
 
-# Specify the command to run on container start
+# Command to run
 CMD ["python", "main.py"]

@@ -1,318 +1,245 @@
+#!/usr/bin/env python3
+# main.py — Generate search-based headline assessments from BigQuery metadata
+
 import os
 import time
 import logging
 import tempfile
 import json
-import re
-from datetime import datetime
+import sys
+import pkg_resources
+import pandas as pd
+from google.cloud import storage
+from google.cloud import bigquery
+from google import genai
+from google.genai.types import GenerateContentConfig, Tool, GoogleSearch, HttpOptions
 
-# --- GCP & Lib Imports ---
-try:
-    from google.cloud import storage
-    import google.auth
-    GCP_LIBS_AVAILABLE = True
-except ImportError:
-    logging.error("Failed to import Google Cloud libraries. Ensure google-cloud-storage is installed.")
-    GCP_LIBS_AVAILABLE = False
+# ——— Configuration ———
+PROJECT_ID                  = os.getenv('GCP_PROJECT_ID')
+GCS_BUCKET_NAME             = os.getenv('GCS_BUCKET_NAME')
+GCS_HEADLINE_OUTPUT_FOLDER  = os.getenv('GCS_HEADLINE_OUTPUT_FOLDER', 'headline-analysis/').rstrip('/') + '/'
+GEMINI_MODEL_NAME           = os.getenv('GEMINI_MODEL_NAME', 'gemini-2.0-flash')
+GEMINI_TEMPERATURE          = float(os.getenv('GEMINI_TEMPERATURE', '0.0'))
+GEMINI_MAX_TOKENS           = int(os.getenv('GEMINI_MAX_TOKENS', '8192'))
+GEMINI_REQ_TIMEOUT          = int(os.getenv('GEMINI_REQ_TIMEOUT', '300'))
+MAX_ASSESSMENTS_TO_GENERATE = int(os.getenv('MAX_ASSESSMENTS_TO_GENERATE', '0'))
+BQ_TABLE                    = f"{PROJECT_ID}.profit_scout.filing_metadata"
+LOCATION                    = os.getenv('GOOGLE_CLOUD_LOCATION', 'us-central1')
 
-try:
-    # Note: Use the Vertex AI integration
-    import google.generativeai as genai
-    from google.generativeai.types import GenerationConfig, Tool # Use types from main library
-    from google.ai.generativelanguage import GoogleSearchRetrieval # Import specific tool part
-    GEMINI_LIB_AVAILABLE = True
-except ImportError:
-    logging.error("Failed to import google-generativeai. Ensure google-generativeai[vertexai] is installed.")
-    GEMINI_LIB_AVAILABLE = False
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-    from google.api_core import exceptions as google_exceptions # For retry
-except ImportError:
-    logging.warning("Tenacity library not found. Retries will not be available.")
-    # Define dummy decorator if tenacity is missing
-    def retry(*args, **kwargs):
-        def decorator(fn):
-            return fn
-        return decorator
-    stop_after_attempt = lambda n: None
-    wait_exponential = lambda *args, **kwargs: None
-    retry_if_exception_type = lambda *args, **kwargs: None
-    google_exceptions = None # Indicate missing exceptions for retry
-
-# --- Configuration (from Environment Variables) ---
-GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-GCP_REGION = os.getenv('GCP_REGION', 'us-central1') # Needed for Vertex AI init
-GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
-# Use the same output prefix as the old news_summarizer for consistency
-GCS_OUTPUT_PREFIX = os.getenv('GCS_NEWS_SUMMARY_PREFIX', 'RiskAssessments/').rstrip('/') + '/'
-# Model (ensure this is a Vertex AI model ID supporting Function Calling/Tools)
-VERTEX_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash-001') # Use the same env var name for simplicity
-
-# --- Input Parameters (Expected from Workflow/Trigger) ---
-INPUT_TICKER = os.getenv('INPUT_TICKER')
-INPUT_FILING_DATE = os.getenv('INPUT_FILING_DATE') # YYYY-MM-DD string
-# Optional Company Name - use Ticker if not provided
-INPUT_COMPANY_NAME = os.getenv('INPUT_COMPANY_NAME', INPUT_TICKER)
-
-# --- Logging Setup ---
+# ——— Logging Setup ———
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format='%(asctime)s - %(levelname)s [%(filename)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logging.info("Installed Python packages: %s", [p.project_name for p in pkg_resources.working_set])
 
-# --- Validate Configuration & Inputs ---
-essential_vars = [
-    ('GCP_PROJECT_ID', GCP_PROJECT_ID),
-    ('GCP_REGION', GCP_REGION),
+# ——— Validate Configuration ———
+missing = [n for n,v in [
+    ('GCP_PROJECT_ID', PROJECT_ID),
     ('GCS_BUCKET_NAME', GCS_BUCKET_NAME),
-    ('GCS_OUTPUT_PREFIX', GCS_OUTPUT_PREFIX),
-    ('VERTEX_MODEL_NAME', VERTEX_MODEL_NAME),
-    ('INPUT_TICKER', INPUT_TICKER),
-    ('INPUT_FILING_DATE', INPUT_FILING_DATE),
-]
-missing_vars = [name for name, value in essential_vars if not value]
-if missing_vars:
-    logging.critical(f"Missing essential environment variables or input parameters: {', '.join(missing_vars)}")
-    raise RuntimeError(f"Missing essential environment variables or input parameters: {', '.join(missing_vars)}")
+    ('GEMINI_MODEL_NAME', GEMINI_MODEL_NAME),
+] if not v]
+if missing:
+    logging.critical(f"Missing env vars: {missing}")
+    raise RuntimeError(f"Missing env vars: {missing}")
 
-if not GCP_LIBS_AVAILABLE or not GEMINI_LIB_AVAILABLE:
-     raise RuntimeError("Required libraries (GCP, google-generativeai) are not available.")
-
-# --- Global Clients (Initialize later) ---
+# ——— Globals ———
 gcs_client = None
-vertex_client = None # Use Vertex AI client
+bq_client = None
+genai_client = None
 
-# --- Assessment Prompt (Copied from notebook script Part 5) ---
-# Ensure this is the prompt you want to use
-risk_assessment_prompt_template = """
-Analyze {company_name} ({ticker}) using Google Search results from the past {lookback_days} days for stock prediction input. Be concise and data-focused. Output *only* the requested sections using the specified format.
+def get_headline_risk_assessment(ticker: str, filed_date: str, lookback_days: int = 30) -> str:
+    """Generate a search-grounded risk assessment using Google Search and a lookback from FiledDate."""
+    end_date = pd.to_datetime(filed_date)
+    start_date = end_date - pd.Timedelta(days=lookback_days)
 
-**1. Key Data Points/Events (Max 3):**
-    * [Bullet point summarizing a critical financial metric, guidance, or event]
-    * [Bullet point summarizing another critical metric/event]
-    * [Bullet point summarizing a third critical metric/event]
+    prompt = f"""
+You are a seasoned financial analyst with a sharp eye for market opportunities, tasked with analyzing recent news for **{ticker}**. Your insights fuel:  
+(1) a financial analysis bot that detects impactful developments, and  
+(2) an ML model predicting stock price movements over the next 90 days.
 
-**2. Overall Sentiment (Choose one: Positive, Negative, Neutral):**
-    [Sentiment Category]
+Deliver concise, grounded insights that highlight events and factors likely to move the stock price up or down.  
+Base all analysis strictly on the provided Google Search results.
 
-**3. Primary 30-Day Expectation (1 sentence):**
-    [State the most likely directional bias or lack thereof for the next 30 days based *only* on the search results]
+---
 
-**4. Key Potential Positive Catalysts (Next 30 days, max 2 points):**
-    * [Potential factor 1, e.g., "Upcoming product launch announcement"]
-    * [Potential factor 2, e.g., "Positive industry trend confirmation"]
+**Analysis Window**:  
+Focus only on news published from **{start_date.date()} to {end_date.date()}**.  
+If no relevant news is found in this range, state: "No significant news found in the specified date range."
 
-**5. Key Potential Negative Risks (Next 30 days, max 2 points):**
-    * [Potential risk 1, e.g., "Increased competitive pressure from X"]
-    * [Potential risk 2, e.g., "Regulatory scrutiny announcement"]
+---
+
+**Instructions**:
+
+1. **Key News Events**  
+   * List up to 3 impactful events (e.g., earnings surprises, product launches, regulatory actions).  
+   * Format: “[Date]: [Event]; Directional Impact: [Upward, Downward, Neutral].”  
+   * Example: “2025-04-15: Earnings beat consensus; Directional Impact: Upward”
+
+2. **Sentiment Analysis**  
+   * State overall sentiment: Positive, Neutral, or Negative.  
+   * List 1–2 drivers influencing this sentiment (e.g., “Earnings momentum,” “Regulatory uncertainty”).
+
+3. **90-Day Outlook**  
+   * One-sentence forecast of stock price direction (upward, downward, or stable) over the next 90 days, based on recent news.
+
+4. **Growth Catalysts**  
+   * Up to 2 factors likely to drive the stock price upward in the next 90 days.  
+   * Format: “[Catalyst]: [Metric or Detail].”  
+   * Example: “Product Launch: New AI platform.”
+
+5. **Potential Challenges**  
+   * Up to 2 factors that could push the stock price downward in the next 90 days.  
+   * Format: “[Challenge]: [Metric or Detail].”  
+   * Example: “Regulatory Probe: Ongoing investigation.”
+
+---
+
+**CRITICAL INSTRUCTIONS**:
+
+- **Output only the analysis.**
+- **Do not include introductions, disclaimers, or speculative content.**
+- **Ensure all insights are grounded in the provided Google Search results.**
+- **Keep the content concise, predictive, and focused on factors that could impact the stock price over the next 90 days.**
+- **If no relevant news is found, state: "No significant news found in the specified date range." and skip the other sections.**
+
+---
+
+**Output Format**:
+- Begin with: `**Headline Summary Date Range**: {start_date} to {end_date}`
+- Use bullet points for all sections.
+
+**Example**:
+
+  * **Headline Summary Date Range**: 2025-04-01 to 2025-04-30  
+  * **Key News Events**:  
+    * 2025-04-15: Earnings beat consensus; Directional Impact: Upward  
+    * 2025-04-20: AI platform launch; Directional Impact: Upward  
+    * 2025-04-25: Regulatory probe announced; Directional Impact: Downward  
+  * **Sentiment Analysis**:  
+    * Sentiment: Positive  
+    * Drivers: Earnings momentum, product innovation  
+  * **90-Day Outlook**:  
+    * Bullish momentum from earnings and product launch, tempered by regulatory concerns.  
+  * **Growth Catalysts**:  
+    * Product Launch: New AI platform  
+    * Analyst Upgrade: Target raised to $75  
+  * **Potential Challenges**:  
+    * Regulatory Probe: Ongoing investigation  
+    * Supply Chain: Potential component delays
+
+**If no news is found**:
+
+  * **Headline Summary Date Range**: 2025-04-01 to 2025-04-30  
+  * No significant news found in the specified date range.
 """
 
-# --- Helper Functions ---
-def check_gcs_blob_exists(bucket, blob_name):
-    """Checks if a specific blob exists in the GCS bucket."""
     try:
-        blob = bucket.blob(blob_name)
-        exists = blob.exists()
-        logging.info(f"Checking existence for gs://{bucket.name}/{blob_name}: {'Exists' if exists else 'Does not exist'}")
-        return exists
+        logging.info(f"Generating assessment for {ticker}…")
+        response = genai_client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+            config=GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())],
+                temperature=GEMINI_TEMPERATURE,
+                max_output_tokens=GEMINI_MAX_TOKENS
+            )
+        )
+        return response.text or "Received empty response"
     except Exception as e:
-        logging.error(f"Error checking GCS existence for {blob_name}: {e}", exc_info=True)
-        return False # Assume doesn't exist on error
+        logging.error(f"Error generating assessment for {ticker}: {e}", exc_info=True)
+        return f"Error: {e}"
 
-# Define exceptions suitable for retry with Vertex AI client
-RETRYABLE_VERTEX_EXCEPTIONS = ()
-if google_exceptions:
-    RETRYABLE_VERTEX_EXCEPTIONS = (
-        google_exceptions.Aborted,
-        google_exceptions.DeadlineExceeded,
-        google_exceptions.InternalServerError,
-        google_exceptions.ResourceExhausted,
-        google_exceptions.ServiceUnavailable,
-        google_exceptions.Unknown,
-        google.auth.exceptions.TransportError # For potential transient network issues
+def main():
+    global gcs_client, bq_client, genai_client
+    start = time.time()
+    processed = skipped = failed = 0
+
+    # Initialize clients
+    bq_client = bigquery.Client(project=PROJECT_ID)
+    gcs_client = storage.Client(project=PROJECT_ID)
+    genai_client = genai.Client(
+        http_options=HttpOptions(api_version="v1"),
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION
     )
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=5, max=30),
-    retry=retry_if_exception_type(RETRYABLE_VERTEX_EXCEPTIONS),
-    reraise=True
-)
-def generate_vertex_content_with_search(model_instance, prompt_text):
-    """Generates content using Vertex AI Gemini with Search tool."""
-    if not model_instance: raise RuntimeError("Vertex AI Gemini model instance not initialized.")
-
-    logging.info("Generating content via Vertex AI Gemini + Search...")
-    # Define the Google Search tool
-    # Note: Using GoogleSearchRetrieval directly
-    search_tool = Tool(google_search_retrieval=GoogleSearchRetrieval(disable_attribution=False))
-
-    # Configure generation - low temperature for factual summary
-    config = GenerationConfig(temperature=0.1)
-
+    # Fetch filings
     try:
-        # Call the model using the specific method if available, or generate_content
-        # Assuming generate_content works with tools for the vertexai client
-        response = model_instance.generate_content(
-            prompt_text,
-            generation_config=config,
-            tools=[search_tool]
-        )
-        logging.info("Received response from Vertex AI Gemini.")
+        df = bq_client.query(f"""
+            SELECT Ticker, AccessionNumber, FiledDate
+            FROM `{BQ_TABLE}`
+            WHERE FormType IN ('10-K','10-Q')
+        """).to_dataframe()
+    except Exception as e:
+        logging.critical(f"Failed to query BigQuery: {e}", exc_info=True)
+        sys.exit(1)
 
-        # --- Robust response handling (similar to previous job) ---
-        if hasattr(response, 'text') and response.text:
-            response_text = response.text
-            logging.info("Content generation successful (from text).")
-        elif hasattr(response, 'parts') and response.parts:
-            response_text = "".join(part.text for part in response.parts if hasattr(part, 'text'))
-            if response_text:
-                logging.info("Content generation successful (from parts).")
-            else:
-                logging.warning(f"Vertex AI returned parts but no text content. Parts: {response.parts}")
-                response_text = "Error: Content generation returned empty parts."
-        elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            reason = response.prompt_feedback.block_reason_message or response.prompt_feedback.block_reason
-            logging.error(f"Content generation blocked. Reason: {reason}")
-            response_text = f"Error: Content generation blocked ({reason})"
+    total = len(df)
+    logging.info(f"Found {total} filings.")
+
+    # List existing assessments
+    bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    existing = {
+        blob.name.split('/')[-1].rsplit('.',1)[0]
+        for blob in bucket.list_blobs(prefix=GCS_HEADLINE_OUTPUT_FOLDER)
+        if blob.name.lower().endswith('.txt')
+    }
+    logging.info(f"{len(existing)} existing assessments.")
+
+    # Determine worklist
+    to_process = []
+    for _, row in df.iterrows():
+        t = row['Ticker']
+        acc = row['AccessionNumber'].replace('-', '')
+        key = f"{t}_{acc}"
+        if key in existing:
+            skipped += 1
         else:
-            # Check for function calls if expecting them (not in this prompt)
-            # Check candidates if available
-            candidates_text = f"Candidates: {response.candidates}" if hasattr(response, 'candidates') else "Candidates attribute not found."
-            logging.warning(f"Vertex AI returned no text/parts or block reason. {candidates_text}")
-            response_text = "Error: Content generation returned unknown empty response."
-        # --- End robust handling ---
+            to_process.append((t, acc, row['FiledDate']))
 
-        # Raise error if generation failed or was blocked to trigger retry or mark failure
-        if response_text.startswith("Error:"):
-             # Use a retryable exception type if possible
-             raise google_exceptions.GoogleAPICallError(response_text) if google_exceptions else RuntimeError(response_text)
+    logging.info(f"{len(to_process)} to process (skipped {skipped}).")
 
-        return response_text
+    if MAX_ASSESSMENTS_TO_GENERATE > 0:
+        to_process = to_process[:MAX_ASSESSMENTS_TO_GENERATE]
 
-    except google_exceptions.GoogleAPICallError as api_error:
-        logging.error(f"Vertex AI API Call Error: {api_error}", exc_info=True)
-        raise # Reraise for tenacity
-    except Exception as e:
-        logging.error(f"Unexpected Error during Vertex AI content generation: {e}", exc_info=True)
-        raise # Reraise
+    tmp_dir = tempfile.mkdtemp()
+    for idx, (t, acc, filed_date) in enumerate(to_process, 1):
+        base = f"{t}_{acc}"
+        local_path = os.path.join(tmp_dir, f"{base}.txt")
+        try:
+            txt = get_headline_risk_assessment(t, filed_date=filed_date, lookback_days=30)
+            with open(local_path, 'w', encoding='utf-8') as f:
+                f.write(txt)
+            blob = bucket.blob(f"{GCS_HEADLINE_OUTPUT_FOLDER}{base}.txt")
+            blob.upload_from_filename(local_path)
+            processed += 1
+            logging.info(f"[{idx}/{len(to_process)}] Uploaded {base}.txt")
+        except Exception as e:
+            failed += 1
+            logging.error(f"Failed {base}: {e}", exc_info=True)
+        finally:
+            try: os.remove(local_path)
+            except: pass
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-def upload_to_gcs(bucket, local_path, blob_path, content_type='text/plain'):
-    """Uploads a local file to GCS with retries."""
-    logging.info(f"Uploading {local_path} to gs://{bucket.name}/{blob_path}")
-    blob = bucket.blob(blob_path)
-    try:
-        blob.upload_from_filename(local_path, content_type=content_type)
-        logging.info(f"Successfully uploaded to gs://{bucket.name}/{blob_path}")
-    except Exception as e:
-        logging.error(f"Failed to upload {local_path} to GCS: {e}", exc_info=True)
-        raise # Reraise for tenacity
+    # Cleanup
+    try: os.rmdir(tmp_dir)
+    except: pass
 
-# --- Main Execution Logic ---
-def main():
-    global gcs_client, vertex_client
-    start_time = time.time()
-    status = "started"
-    assessment_txt_gcs_uri = None
-    local_temp_path = None
-    log_prefix = f"{INPUT_TICKER} - {INPUT_FILING_DATE}"
-    logging.info(f"--- Starting Headline Assessment Job for {log_prefix} ---")
-
-    # Construct output filename based on Ticker and FilingDate
-    # Format date as YYYYMMDD for filename consistency
-    try:
-        filing_date_dt = datetime.datetime.strptime(INPUT_FILING_DATE, '%Y-%m-%d')
-        date_str_for_filename = filing_date_dt.strftime('%Y%m%d')
-    except ValueError:
-        logging.error(f"Invalid INPUT_FILING_DATE format: {INPUT_FILING_DATE}. Using original string.")
-        date_str_for_filename = INPUT_FILING_DATE.replace('-','') # Fallback
-
-    assessment_filename = f"RiskAssessment_{INPUT_TICKER}_{date_str_for_filename}.txt"
-    gcs_output_path = os.path.join(GCS_OUTPUT_PREFIX, assessment_filename)
-
-    temp_dir = tempfile.mkdtemp() # Create a temporary directory for this run
-
-    try:
-        # Initialize GCS Client using ADC
-        logging.info(f"Initializing GCS client for project {GCP_PROJECT_ID}...")
-        gcs_client = storage.Client(project=GCP_PROJECT_ID)
-        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-        logging.info(f"GCS client initialized for bucket '{GCS_BUCKET_NAME}'.")
-
-        # Initialize Vertex AI Client using ADC
-        # Use google.generativeai library configured for Vertex
-        logging.info(f"Initializing Vertex AI Gemini client (Project: {GCP_PROJECT_ID}, Location: {GCP_REGION})...")
-        # No explicit client object needed like 'vertexai.init()', library handles it via ADC
-        # We just instantiate the model later.
-        vertex_model = genai.GenerativeModel(f'projects/{GCP_PROJECT_ID}/locations/{GCP_REGION}/endpoints/{VERTEX_MODEL_NAME}') # Use specific endpoint format if needed, else just model name might work
-        # Or more simply if library handles resolution:
-        # vertex_model = genai.GenerativeModel(VERTEX_MODEL_NAME)
-
-        logging.info(f"Vertex AI Gemini client configured for model {VERTEX_MODEL_NAME}.")
-
-        # Check if output TXT already exists
-        if check_gcs_blob_exists(bucket, gcs_output_path):
-            logging.info(f"Assessment TXT already exists: gs://{GCS_BUCKET_NAME}/{gcs_output_path}. Skipping.")
-            status = "skipped_exists"
-            assessment_txt_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_output_path}"
-        else:
-            # Generate Assessment
-            # Use a lookback period (e.g., 14 or 30 days from filing date)
-            lookback_days = 14 # Or make configurable via env var
-            prompt = risk_assessment_prompt_template.format(
-                company_name=INPUT_COMPANY_NAME,
-                ticker=INPUT_TICKER,
-                lookback_days=lookback_days
-            )
-            assessment_text = generate_vertex_content_with_search(vertex_model, prompt)
-            status = "assessment_generated"
-
-            # Save Assessment TXT locally
-            local_temp_path = os.path.join(temp_dir, assessment_filename)
-            with open(local_temp_path, 'w', encoding='utf-8') as f_txt:
-                f_txt.write(assessment_text)
-            logging.info(f"Assessment text saved locally to {local_temp_path}")
-
-            # Upload Assessment TXT to GCS
-            upload_to_gcs(bucket, local_temp_path, gcs_output_path, content_type='text/plain')
-            assessment_txt_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_output_path}"
-            status = "assessment_uploaded"
-
-        # --- Output for Workflow ---
-        output_data = {
-            "job_name": "generate-headline-assessment",
-            "ticker": INPUT_TICKER,
-            "filing_date": INPUT_FILING_DATE,
-            "status": status,
-            "output_assessment_txt_gcs_path": assessment_txt_gcs_uri
-        }
-        print(json.dumps(output_data)) # Log output as JSON
-
-    except google.auth.exceptions.DefaultCredentialsError as cred_err:
-        logging.critical(f"GCP Credentials Error: {cred_err}", exc_info=True)
-        status = "error_auth"
-        print(json.dumps({ "job_name": "generate-headline-assessment", "status": status, "error": str(cred_err) }))
-        raise
-    except Exception as e:
-        logging.error(f"An error occurred during the headline-assessment job for {log_prefix}: {e}", exc_info=True)
-        status = "error_runtime"
-        print(json.dumps({ "job_name": "generate-headline-assessment", "status": status, "error": str(e) }))
-        raise
-    finally:
-        # Cleanup local files/directory
-        logging.debug(f"Cleaning up temporary directory: {temp_dir}")
-        if local_temp_path and os.path.exists(local_temp_path):
-             try: os.remove(local_temp_path)
-             except OSError as rm_err: logging.warning(f"Could not remove temp file {local_temp_path}: {rm_err}")
-        if os.path.exists(temp_dir):
-             try: os.rmdir(temp_dir)
-             except OSError as rmdir_err: logging.warning(f"Could not remove temp dir {temp_dir}: {rmdir_err}")
-
-        end_time = time.time()
-        logging.info(f"--- Headline Assessment Job for {log_prefix} finished in {end_time - start_time:.2f} seconds. Final Status: {status} ---")
+    duration = time.time() - start
+    logging.info(f"Done in {duration:.1f}s — processed {processed}, failed {failed}")
+    print(json.dumps({
+        "status":        "completed_with_errors" if failed else "completed",
+        "total":         total,
+        "processed":     processed,
+        "skipped":       skipped,
+        "failed":        failed,
+        "duration_sec":  round(duration,2)
+    }))
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

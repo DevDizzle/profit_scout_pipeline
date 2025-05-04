@@ -1,37 +1,22 @@
-# Use an official Python runtime as a parent image
+# profit_scout_pipeline/services/price_loader/Dockerfile
+
+# 1) Base image
 FROM python:3.11-slim
 
-# Set environment variables
+# 2) Environment
 ENV PYTHONUNBUFFERED=1 \
-    WORKDIR=/app \
-    # Set timezone info to potentially help tz-aware libraries like pandas/yfinance
-    TZ=Etc/UTC \
-    DEBIAN_FRONTEND=noninteractive
+    TZ=UTC
 
-# Set the working directory
-WORKDIR ${WORKDIR}
+# 3) Working directory
+WORKDIR /app
 
-# Install system dependencies (keep if yfinance or dependencies need compilation)
-# Hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # build-essential contains gcc, python3-dev, libc-dev etc.
-    build-essential \
-    # Add tzdata for timezone support if needed by pandas/yfinance
-    tzdata \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy the requirements file first for better Docker layer caching
+# 4) Install Python deps in one shot
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip
-# Removed --require-hashes unless you specifically generate hashes
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the application code into the container
-# Assumes your code is in ./src relative to the Dockerfile
+# 5) Copy application code
 COPY src/ .
 
-# Specify the command to run on container start
-# Renamed to main.py for consistency with other jobs
+# 6) Default command
 CMD ["python", "main.py"]

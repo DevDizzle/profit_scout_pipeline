@@ -1,124 +1,143 @@
-# infrastructure/terraform/scheduling.tf
-
-# --- Trigger for the Main Filing Workflow ---
-resource "google_cloud_scheduler_job" "trigger_main_workflow" {
-  project     = var.gcp_project_id
-  region      = var.workflow_region # Use workflow region for scheduler job location
-  name        = "trigger-main-filing-workflow"
-  description = "Triggers the main filing processing workflow daily (M-F)"
-  schedule    = var.main_workflow_schedule # e.g., "0 6 * * MON-FRI"
-  time_zone   = var.scheduler_timezone   # e.g., "America/New_York"
+# --- Fetch Filings Job (Runs at 12:00 PM and 5:00 PM, Mon–Fri) ---
+resource "google_cloud_scheduler_job" "trigger_fetch_filings" {
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-fetch-filings"
+  schedule         = "0 12,17 * * MON-FRI"  # 12:00 PM, 5:00 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
 
   http_target {
-    # Use the Workflow Execution API endpoint
-    # NOTE: Ensure the google_workflows_workflow resource is named "main_workflow"
-    uri = "https://workflowexecutions.googleapis.com/v1/${google_workflows_workflow.main_workflow.id}/executions"
-
     http_method = "POST"
-    # No body needed for basic execution trigger, can add arguments in body if needed later
-    # body        = base64encode(jsonencode({ argument = jsonencode({ key = "value" }) }))
-
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.fetch_filings_job_name}:execute"
     oidc_token {
-      # Use the default Cloud Scheduler service account
       service_account_email = var.scheduler_sa_email
-      # Audience should be the API endpoint being called
-      audience = "https://workflowexecutions.googleapis.com/"
-      # Alternate audience (sometimes needed): google_workflows_workflow.main_workflow.id
     }
   }
 
-  attempt_deadline = "320s" # Allow some time for the request to complete
-
-  retry_config {
-    retry_count = 1
-  }
-
   depends_on = [
-    # Ensure workflow and necessary IAM bindings exist first
-    google_workflows_workflow.main_workflow,
-    google_project_iam_member.scheduler_workflow_invoker,
+    google_cloud_run_v2_job.fetch_filings_job,
+    google_project_iam_member.scheduler_run_job_invoker,
     google_project_iam_member.scheduler_act_as_self,
   ]
 }
 
+# --- Download PDF (Runs at 12:15 PM and 5:15 PM) ---
+resource "google_cloud_scheduler_job" "trigger_download_pdf" {
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-download-pdf"
+  schedule         = "15 12,17 * * MON-FRI"  # 12:15 PM, 5:15 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
 
-# --- Trigger for the Price Loader Job ---
+  http_target {
+    http_method = "POST"
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.download_pdf_job_name}:execute"
+    oidc_token {
+      service_account_email = var.scheduler_sa_email
+    }
+  }
+
+  depends_on = [google_cloud_run_v2_job.download_pdf_job]
+}
+
+# --- Financial Extraction (Runs at 12:30 PM and 5:30 PM) ---
+resource "google_cloud_scheduler_job" "trigger_financial_extraction" {
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-financial-extraction"
+  schedule         = "30 12,17 * * MON-FRI"  # 12:30 PM, 5:30 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.financial_extraction_job_name}:execute"
+    oidc_token {
+      service_account_email = var.scheduler_sa_email
+    }
+  }
+
+  depends_on = [google_cloud_run_v2_job.financial_extraction_job]
+}
+
+# --- Headline Assessment (Runs at 12:30 PM and 5:30 PM) ---
+resource "google_cloud_scheduler_job" "trigger_headline_assessment" {
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-headline-assessment"
+  schedule         = "30 12,17 * * MON-FRI"  # 12:30 PM, 5:30 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.headline_assessment_job_name}:execute"
+    oidc_token {
+      service_account_email = var.scheduler_sa_email
+    }
+  }
+
+  depends_on = [google_cloud_run_v2_job.headline_assessment_job]
+}
+
+# --- Qualitative Analysis (Runs at 12:45 PM and 5:45 PM) ---
+resource "google_cloud_scheduler_job" "trigger_qualitative_analysis" {
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-qualitative-analysis"
+  schedule         = "45 12,17 * * MON-FRI"  # 12:45 PM, 5:45 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.qualitative_analysis_job_name}:execute"
+    oidc_token {
+      service_account_email = var.scheduler_sa_email
+    }
+  }
+
+  depends_on = [google_cloud_run_v2_job.qualitative_analysis_job]
+}
+
+# --- Price Loader (Runs at 4:00 PM) ---
 resource "google_cloud_scheduler_job" "trigger_price_loader" {
-  project     = var.gcp_project_id
-  region      = var.gcp_region # Location for the scheduler job itself
-  name        = "trigger-price-loader-job"
-  description = "Triggers the price loader Cloud Run job daily (M-F)"
-  schedule    = var.price_loader_schedule # e.g., "0 16 * * MON-FRI"
-  time_zone   = var.scheduler_timezone
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-price-loader"
+  schedule         = "0 16 * * MON-FRI"  # 4:00 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
 
   http_target {
-    # Use the Cloud Run v2 Job :run endpoint URI format
-    uri = "https://${var.gcp_region}-run.googleapis.com/apis/run.googleapis.com/v1/${google_cloud_run_v2_job.price_loader_job.id}:run"
-
     http_method = "POST"
-    # No body needed to just run the job
-
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.price_loader_job_name}:execute"
     oidc_token {
-      # Use the default Cloud Scheduler service account
       service_account_email = var.scheduler_sa_email
-      # Audience should be the URL being called (the :run endpoint)
-      audience = "https://${var.gcp_region}-run.googleapis.com/apis/run.googleapis.com/v1/${google_cloud_run_v2_job.price_loader_job.id}:run"
     }
   }
 
-  attempt_deadline = "320s"
-
-  retry_config {
-    retry_count = 1
-  }
-
-  depends_on = [
-    # Ensure job and necessary IAM bindings exist first
-    google_cloud_run_v2_job.price_loader_job,
-    google_project_iam_member.scheduler_run_job_invoker,
-    google_project_iam_member.scheduler_act_as_self,
-    # Optional: depends_on fine-grained invoker role if used in iam.tf
-    # google_cloud_run_v2_job_iam_member.price_loader_scheduler_invoker,
-  ]
+  depends_on = [google_cloud_run_v2_job.price_loader_job]
 }
 
-
-# --- Trigger for the Ratio Calculator Job ---
+# --- Ratio Calculator (Runs at 4:15 PM) ---
 resource "google_cloud_scheduler_job" "trigger_ratio_calculator" {
-  project     = var.gcp_project_id
-  region      = var.gcp_region # Location for the scheduler job itself
-  name        = "trigger-ratio-calculator-job"
-  description = "Triggers the ratio calculator Cloud Run job daily (M-F)"
-  schedule    = var.ratio_calculator_schedule # e.g., "30 16 * * MON-FRI"
-  time_zone   = var.scheduler_timezone
+  project          = var.gcp_project_id
+  region           = var.gcp_region
+  name             = "profit-scout-ratio-calculator"
+  schedule         = "15 16 * * MON-FRI"  # 4:15 PM
+  time_zone        = var.scheduler_timezone
+  attempt_deadline = "1800s"
 
   http_target {
-    # Use the Cloud Run v2 Job :run endpoint URI format
-    uri = "https://${var.gcp_region}-run.googleapis.com/apis/run.googleapis.com/v1/${google_cloud_run_v2_job.ratio_calculator_job.id}:run"
-
     http_method = "POST"
-    # No body needed to just run the job
-
+    uri         = "https://run.googleapis.com/v2/projects/${var.gcp_project_id}/locations/${var.gcp_region}/jobs/${var.ratio_calculator_job_name}:execute"
     oidc_token {
-      # Use the default Cloud Scheduler service account
       service_account_email = var.scheduler_sa_email
-      # Audience should be the URL being called (the :run endpoint)
-      audience = "https://${var.gcp_region}-run.googleapis.com/apis/run.googleapis.com/v1/${google_cloud_run_v2_job.ratio_calculator_job.id}:run"
     }
   }
 
-  attempt_deadline = "320s"
-
-  retry_config {
-    retry_count = 1
-  }
-
-  depends_on = [
-    # Ensure job and necessary IAM bindings exist first
-    google_cloud_run_v2_job.ratio_calculator_job,
-    google_project_iam_member.scheduler_run_job_invoker,
-    google_project_iam_member.scheduler_act_as_self,
-    # Optional: depends_on fine-grained invoker role if used in iam.tf
-    # google_cloud_run_v2_job_iam_member.ratio_calculator_scheduler_invoker,
-  ]
+  depends_on = [google_cloud_run_v2_job.ratio_calculator_job]
 }

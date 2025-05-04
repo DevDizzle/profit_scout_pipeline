@@ -1,46 +1,45 @@
 # infrastructure/terraform/cloudrun_jobs.tf
 
-# --- Locals ---
 locals {
-  # Base path for Docker images in Artifact Registry
   artifact_registry_base = "${var.gcp_region}-docker.pkg.dev/${var.gcp_project_id}/${var.artifact_registry_repo_name}"
-
-  # Common environment variables for many jobs
   common_env_vars = {
     GCP_PROJECT_ID = var.gcp_project_id
     BQ_DATASET_ID  = var.bq_dataset_id
-    # Note: Bucket name often needed, added specifically where required by script
-    # GCS_BUCKET_NAME = var.gcs_bucket_name # Added per-job as needed
   }
-
-  # Common job settings
   default_job_template = {
-    # task_count = 1 # Default is 1, uncomment if changing
     template = {
-      # Default values, can be overridden per job
-      timeout         = var.default_job_timeout
-      max_retries     = var.default_job_retries
-      execution_environment = "EXECUTION_ENVIRONMENT_GEN2" # Use Gen2 environment
-      containers = [{
-        # image, resources, env[] defined per job
-        resources = {
-          limits = {
-            cpu    = var.default_job_cpu
-            memory = var.default_job_memory
+      timeout               = var.default_job_timeout
+      max_retries           = var.default_job_retries
+      execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+      containers = [
+        {
+          resources = {
+            limits = {
+              cpu    = var.default_job_cpu
+              memory = var.default_job_memory
+            }
           }
-          # startup_cpu_boost = true # Optional: boost CPU at startup
         }
-      }]
+      ]
     }
   }
 }
 
-# --- Job Definitions ---
+locals {
+  fetch_filings_image         = "${local.artifact_registry_base}/fetch-filings:latest"
+  download_pdf_image          = "${local.artifact_registry_base}/download-pdf:latest"
+  qualitative_analysis_image  = "${local.artifact_registry_base}/qualitative-analysis:latest"
+  headline_assessment_image   = "${local.artifact_registry_base}/headline-assessment:latest"
+  price_loader_image          = "${local.artifact_registry_base}/price-loader:latest"
+  ratio_calculator_image      = "${local.artifact_registry_base}/ratio-calculator:latest"
+  financial_extraction_image  = "${local.artifact_registry_base}/financial-extraction:latest"
+}
 
 resource "google_cloud_run_v2_job" "fetch_filings_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.fetch_filings_job_name
+  deletion_protection = false
 
   template {
     template {
@@ -50,8 +49,7 @@ resource "google_cloud_run_v2_job" "fetch_filings_job" {
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/fetch-filings:${var.docker_image_tag}"
-        
+        image = local.fetch_filings_image
         env {
           name  = "GCP_PROJECT_ID"
           value = local.common_env_vars.GCP_PROJECT_ID
@@ -99,24 +97,21 @@ resource "google_cloud_run_v2_job" "fetch_filings_job" {
   depends_on = [google_service_account.fetch_filings_sa]
 }
 
-
-
-# --- Job 2: Download PDF ---
 resource "google_cloud_run_v2_job" "download_pdf_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.download_pdf_job_name
+  deletion_protection = false
 
   template {
     template {
       service_account       = google_service_account.download_pdf_sa.email
-      timeout               = "600s"
-      max_retries           = local.default_job_template.template.max_retries
+      timeout               = "3600s"
+      max_retries           = var.default_job_retries
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/download-pdf:${var.docker_image_tag}"
-
+        image = local.download_pdf_image
         env {
           name  = "GCP_PROJECT_ID"
           value = local.common_env_vars.GCP_PROJECT_ID
@@ -126,32 +121,16 @@ resource "google_cloud_run_v2_job" "download_pdf_job" {
           value = var.gcs_bucket_name
         }
         env {
-          name  = "GCS_PDF_FOLDER"
-          value = var.gcs_pdf_folder
+          name  = "BQ_DATASET_ID"
+          value = var.bq_dataset_id
         }
         env {
-          name  = "SEC_API_SECRET_ID"
-          value = var.sec_api_secret_name
-        }
-        env {
-          name  = "SEC_API_SECRET_VERSION"
-          value = var.api_secret_version
+          name  = "BQ_METADATA_TABLE_ID"
+          value = var.bq_metadata_table_id
         }
         env {
           name  = "LOG_LEVEL"
           value = "INFO"
-        }
-        env {
-          name  = "INPUT_TICKER"
-          value = "PLACEHOLDER_TICKER"
-        }
-        env {
-          name  = "INPUT_ACCESSION_NUMBER"
-          value = "PLACEHOLDER_ACCNO"
-        }
-        env {
-          name  = "INPUT_FILING_URL"
-          value = "PLACEHOLDER_URL"
         }
 
         resources {
@@ -164,11 +143,11 @@ resource "google_cloud_run_v2_job" "download_pdf_job" {
   depends_on = [google_service_account.download_pdf_sa]
 }
 
-# --- Job 3: Generate Qualitative Analysis ---
 resource "google_cloud_run_v2_job" "qualitative_analysis_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.qualitative_analysis_job_name
+  deletion_protection = false
 
   template {
     template {
@@ -178,8 +157,7 @@ resource "google_cloud_run_v2_job" "qualitative_analysis_job" {
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/generate-qualitative-analysis:${var.docker_image_tag}"
-
+        image = local.qualitative_analysis_image
         resources {
           limits = {
             cpu    = "2000m"
@@ -196,12 +174,16 @@ resource "google_cloud_run_v2_job" "qualitative_analysis_job" {
           value = var.gcs_bucket_name
         }
         env {
+          name  = "GCS_PDF_PREFIX"
+          value = var.gcs_pdf_prefix
+        }
+        env {
           name  = "GCS_ANALYSIS_TXT_PREFIX"
           value = var.gcs_analysis_txt_prefix
         }
         env {
-          name  = "GCS_METADATA_CSV_PREFIX"
-          value = var.gcs_analysis_metadata_csv_prefix
+          name  = "BQ_METADATA_TABLE_ID"
+          value = var.bq_metadata_table_id
         }
         env {
           name  = "GEMINI_API_SECRET_ID"
@@ -217,39 +199,19 @@ resource "google_cloud_run_v2_job" "qualitative_analysis_job" {
         }
         env {
           name  = "GEMINI_TEMPERATURE"
-          value = "0.2"
+          value = tostring(var.gemini_temperature)
         }
         env {
           name  = "GEMINI_MAX_TOKENS"
-          value = "8192"
+          value = tostring(var.gemini_max_tokens)
         }
         env {
           name  = "GEMINI_REQ_TIMEOUT"
-          value = "300"
+          value = tostring(var.gemini_req_timeout)
         }
         env {
           name  = "LOG_LEVEL"
           value = "INFO"
-        }
-        env {
-          name  = "INPUT_PDF_GCS_PATH"
-          value = "gs://placeholder/placeholder.pdf"
-        }
-        env {
-          name  = "INPUT_TICKER"
-          value = "PLACEHOLDER_TICKER"
-        }
-        env {
-          name  = "INPUT_ACCESSION_NUMBER"
-          value = "PLACEHOLDER_ACCNO"
-        }
-        env {
-          name  = "INPUT_FILING_DATE"
-          value = "1970-01-01"
-        }
-        env {
-          name  = "INPUT_FORM_TYPE"
-          value = "PLACEHOLDER_FORM"
         }
       }
     }
@@ -258,29 +220,27 @@ resource "google_cloud_run_v2_job" "qualitative_analysis_job" {
   depends_on = [google_service_account.qualitative_analysis_sa]
 }
 
-# --- Job 4: Generate Headline Assessment ---
 resource "google_cloud_run_v2_job" "headline_assessment_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.headline_assessment_job_name
+  deletion_protection = false
 
   template {
     template {
       service_account       = google_service_account.headline_assessment_sa.email
       timeout               = "1800s"
-      max_retries           = local.default_job_template.template.max_retries
+      max_retries           = var.default_job_retries
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/generate-headline-assessment:${var.docker_image_tag}"
-
+        image = local.headline_assessment_image
         resources {
           limits = {
             cpu    = "2000m"
             memory = "2Gi"
           }
         }
-
         env {
           name  = "GCP_PROJECT_ID"
           value = local.common_env_vars.GCP_PROJECT_ID
@@ -294,7 +254,7 @@ resource "google_cloud_run_v2_job" "headline_assessment_job" {
           value = var.gcs_bucket_name
         }
         env {
-          name  = "GCS_NEWS_SUMMARY_PREFIX"
+          name  = "GCS_HEADLINE_OUTPUT_FOLDER"
           value = var.gcs_headline_assessment_prefix
         }
         env {
@@ -305,18 +265,6 @@ resource "google_cloud_run_v2_job" "headline_assessment_job" {
           name  = "LOG_LEVEL"
           value = "INFO"
         }
-        env {
-          name  = "INPUT_TICKER"
-          value = "PLACEHOLDER_TICKER"
-        }
-        env {
-          name  = "INPUT_FILING_DATE"
-          value = "1970-01-01"
-        }
-        env {
-          name  = "INPUT_COMPANY_NAME"
-          value = "PLACEHOLDER_NAME"
-        }
       }
     }
   }
@@ -324,11 +272,11 @@ resource "google_cloud_run_v2_job" "headline_assessment_job" {
   depends_on = [google_service_account.headline_assessment_sa]
 }
 
-# --- Job 5: Price Loader ---
 resource "google_cloud_run_v2_job" "price_loader_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.price_loader_job_name
+  deletion_protection = false
 
   template {
     template {
@@ -338,8 +286,7 @@ resource "google_cloud_run_v2_job" "price_loader_job" {
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/price-loader:${var.docker_image_tag}"
-
+        image = local.price_loader_image
         resources {
           limits = local.default_job_template.template.containers[0].resources.limits
         }
@@ -371,11 +318,11 @@ resource "google_cloud_run_v2_job" "price_loader_job" {
   depends_on = [google_service_account.price_loader_sa]
 }
 
-# --- Job 6: Ratio Calculator ---
 resource "google_cloud_run_v2_job" "ratio_calculator_job" {
   project  = var.gcp_project_id
   location = var.gcp_region
   name     = var.ratio_calculator_job_name
+  deletion_protection = false
 
   template {
     template {
@@ -385,8 +332,7 @@ resource "google_cloud_run_v2_job" "ratio_calculator_job" {
       execution_environment = local.default_job_template.template.execution_environment
 
       containers {
-        image = "${local.artifact_registry_base}/ratio-calculator:${var.docker_image_tag}"
-
+        image = local.ratio_calculator_image
         resources {
           limits = {
             cpu    = "2000m"
@@ -403,16 +349,20 @@ resource "google_cloud_run_v2_job" "ratio_calculator_job" {
           value = local.common_env_vars.BQ_DATASET_ID
         }
         env {
-          name  = "BQ_FINANCIALS_BS_TABLE_ID"
-          value = var.bq_bs_table_id
+          name  = "GCS_BUCKET_NAME"
+          value = var.gcs_bucket_name
         }
         env {
-          name  = "BQ_FINANCIALS_IS_TABLE_ID"
-          value = var.bq_is_table_id
+          name  = "GCS_BS_PREFIX"
+          value = var.gcs_bs_prefix
         }
         env {
-          name  = "BQ_FINANCIALS_CF_TABLE_ID"
-          value = var.bq_cf_table_id
+          name  = "GCS_IS_PREFIX"
+          value = var.gcs_is_prefix
+        }
+        env {
+          name  = "GCS_CF_PREFIX"
+          value = var.gcs_cf_prefix
         }
         env {
           name  = "BQ_PRICE_TABLE_ID"
@@ -451,4 +401,118 @@ resource "google_cloud_run_v2_job" "ratio_calculator_job" {
   }
 
   depends_on = [google_service_account.ratio_calculator_sa]
+}
+
+resource "google_cloud_run_v2_job" "financial_extraction_job" {
+  project  = var.gcp_project_id
+  location = var.gcp_region
+  name     = var.financial_extraction_job_name
+  deletion_protection = false
+
+  template {
+    template {
+      service_account       = google_service_account.financial_extraction_sa.email
+      timeout               = "3600s"
+      max_retries           = local.default_job_template.template.max_retries
+      execution_environment = local.default_job_template.template.execution_environment
+
+      containers {
+        image = local.financial_extraction_image
+        resources {
+          limits = {
+            cpu    = "2000m"
+            memory = "2Gi"
+          }
+        }
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = local.common_env_vars.GCP_PROJECT_ID
+        }
+        env {
+          name  = "BQ_DATASET_ID"
+          value = local.common_env_vars.BQ_DATASET_ID
+        }
+        env {
+          name  = "BQ_METADATA_TABLE_ID"
+          value = var.bq_metadata_table_id
+        }
+        env {
+          name  = "GCS_BUCKET_NAME"
+          value = var.gcs_bucket_name
+        }
+        env {
+          name  = "GCS_BS_PREFIX"
+          value = var.gcs_bs_prefix
+        }
+        env {
+          name  = "GCS_IS_PREFIX"
+          value = var.gcs_is_prefix
+        }
+        env {
+          name  = "GCS_CF_PREFIX"
+          value = var.gcs_cf_prefix
+        }
+        env {
+          name  = "SEC_API_SECRET_ID"
+          value = var.sec_api_secret_name
+        }
+        env {
+          name  = "SEC_API_SECRET_VERSION"
+          value = var.api_secret_version
+        }
+        env {
+          name  = "MAX_FILINGS_TO_PROCESS"
+          value = "0"
+        }
+        env {
+          name  = "LOG_LEVEL"
+          value = "INFO"
+        }
+      }
+    }
+  }
+
+  depends_on = [google_service_account.financial_extraction_sa]
+}
+
+resource "google_service_account" "fetch_filings_sa" {
+  project      = var.gcp_project_id
+  account_id   = "profit-scout-fetch-filings-sa"
+  display_name = "Profit Scout Fetch Filings Job SA"
+}
+
+resource "google_service_account" "download_pdf_sa" {
+  project      = var.gcp_project_id
+  account_id   = "profit-scout-download-pdf-sa"
+  display_name = "Profit Scout Download PDF Job SA"
+}
+
+resource "google_service_account" "qualitative_analysis_sa" {
+  project      = var.gcp_project_id
+  account_id   = "profit-scout-qual-anlys-sa"
+  display_name = "Profit Scout Qualitative Analysis Job SA"
+}
+
+resource "google_service_account" "headline_assessment_sa" {
+  project      = var.gcp_project_id
+  account_id   = "headline-assess-sa"
+  display_name = "Headline Assessment Service Account"
+}
+
+resource "google_service_account" "price_loader_sa" {
+  project      = var.gcp_project_id
+  account_id   = "profit-scout-price-loader-sa"
+  display_name = "Profit Scout Price Loader Job SA"
+}
+
+resource "google_service_account" "ratio_calculator_sa" {
+  project      = var.gcp_project_id
+  account_id   = "profit-scout-ratio-calc-sa"
+  display_name = "Profit Scout Ratio Calculator Job SA"
+}
+
+resource "google_service_account" "financial_extraction_sa" {
+  project      = var.gcp_project_id
+  account_id   = "financial-extract-sa"
+  display_name = "Financial Extraction Service Account"
 }

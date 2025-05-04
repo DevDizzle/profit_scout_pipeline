@@ -12,7 +12,7 @@ terraform {
 
   backend "gcs" {
     bucket = "profit-scout"
-    prefix = "profit-scout/terraform"
+    prefix = "terraform"
   }
 }
 

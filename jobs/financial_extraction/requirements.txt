@@ -3,7 +3,6 @@ pandas==2.0.3
 google-cloud-bigquery==3.11.4
 google-cloud-secret-manager==2.16.2
 google-cloud-storage==2.10.0
-tqdm==4.66.1
-google-genai>=0.1.0
+sec-api==1.0.17
 tenacity==8.2.3
-db-dtypes>=1.1.0
+pyarrow==12.0.1

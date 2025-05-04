@@ -1,450 +1,339 @@
+#!/usr/bin/env python3
+# main.py — Batch SEC filing qualitative analysis via Gemini File API
+
 import os
 import time
 import logging
 import tempfile
-import json
-import re
-import asyncio # For waiting on Gemini file processing
+import asyncio
+import warnings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.cloud import storage, secretmanager
+from google import genai
+from google.genai.types import GenerateContentConfig, HttpOptions, FileData, Part
+from google.api_core import exceptions as core_exceptions
 
-# --- GCP & Lib Imports ---
-try:
-    from google.cloud import storage, secretmanager
-    import google.auth
-    import pandas as pd # For metadata CSV
-    GCP_LIBS_AVAILABLE = True
-except ImportError:
-    logging.error("Failed to import Google Cloud or pandas libraries.")
-    GCP_LIBS_AVAILABLE = False
-
-try:
-    import google.generativeai as genai
-    # from google.generativeai.types import File # If needed for type hinting
-    GEMINI_LIB_AVAILABLE = True
-except ImportError:
-    logging.error("Failed to import google-generativeai. Ensure it's installed.")
-    GEMINI_LIB_AVAILABLE = False
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-except ImportError:
-    logging.warning("Tenacity library not found. Retries will not be available.")
-    # Define dummy decorator if tenacity is missing
-    def retry(*args, **kwargs):
-        def decorator(fn):
-            return fn
-        return decorator
-    stop_after_attempt = lambda n: None
-    wait_exponential = lambda *args, **kwargs: None
-    retry_if_exception_type = lambda *args, **kwargs: None # Dummy for type hint
-
-# --- Configuration (from Environment Variables) ---
-GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
-# Input PDF Prefix (used only for constructing potential input paths if needed)
-# GCS_PDF_PREFIX = os.getenv('GCS_PDF_FOLDER', 'sec-pdf/').rstrip('/') + '/'
-# Output Prefixes
-GCS_QUALITATIVE_TXT_PREFIX = os.getenv('GCS_ANALYSIS_TXT_PREFIX', 'Qualitative_Analysis_TXT_R1000/').rstrip('/') + '/'
-GCS_METADATA_CSV_PREFIX = os.getenv('GCS_METADATA_CSV_PREFIX', 'Qualitative_Metadata_R1000/').rstrip('/') + '/'
-# Secrets & Model
-GEMINI_API_SECRET_ID = os.getenv('GEMINI_API_KEY_SECRET_ID', 'gemini-api-key')
-GEMINI_API_KEY_SECRET_VERSION = os.getenv('GEMINI_API_KEY_SECRET_VERSION', 'latest')
-GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash') # Ensure this model supports File API
-# Gemini Config
-GEMINI_TEMPERATURE = float(os.getenv('GEMINI_TEMPERATURE', '0.2'))
-GEMINI_MAX_TOKENS = int(os.getenv('GEMINI_MAX_TOKENS', '8192'))
-GEMINI_REQ_TIMEOUT = int(os.getenv('GEMINI_REQ_TIMEOUT', '300')) # Seconds
-
-# --- Input Parameters (Expected from Workflow/Trigger) ---
-INPUT_PDF_GCS_PATH = os.getenv('INPUT_PDF_GCS_PATH') # e.g., gs://bucket/sec-pdf/TICKER_ACCNO.pdf
-INPUT_TICKER = os.getenv('INPUT_TICKER')
-INPUT_ACCESSION_NUMBER = os.getenv('INPUT_ACCESSION_NUMBER') # Cleaned
-INPUT_FILING_DATE = os.getenv('INPUT_FILING_DATE') # YYYY-MM-DD string
-INPUT_FORM_TYPE = os.getenv('INPUT_FORM_TYPE') # e.g., 10-K or 10-Q
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s [%(filename)s:%(lineno)d] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+# ——— Suppress Pydantic warning about built-in any ———
+warnings.filterwarnings(
+    "ignore",
+    r".*<built-in function any> is not a Python type.*",
+    category=UserWarning,
+    module="pydantic._internal._generate_schema"
 )
 
-# --- Validate Configuration & Inputs ---
-essential_vars = [
-    ('GCP_PROJECT_ID', GCP_PROJECT_ID),
-    ('GCS_BUCKET_NAME', GCS_BUCKET_NAME),
-    ('GCS_QUALITATIVE_TXT_PREFIX', GCS_QUALITATIVE_TXT_PREFIX),
-    ('GCS_METADATA_CSV_PREFIX', GCS_METADATA_CSV_PREFIX),
-    ('GEMINI_API_SECRET_ID', GEMINI_API_SECRET_ID),
-    ('GEMINI_MODEL_NAME', GEMINI_MODEL_NAME),
-    ('INPUT_PDF_GCS_PATH', INPUT_PDF_GCS_PATH),
-    ('INPUT_TICKER', INPUT_TICKER),
-    ('INPUT_ACCESSION_NUMBER', INPUT_ACCESSION_NUMBER),
-    ('INPUT_FILING_DATE', INPUT_FILING_DATE),
-    ('INPUT_FORM_TYPE', INPUT_FORM_TYPE),
-]
-missing_vars = [name for name, value in essential_vars if not value]
-if missing_vars:
-    logging.critical(f"Missing essential environment variables or input parameters: {', '.join(missing_vars)}")
-    raise RuntimeError(f"Missing essential environment variables or input parameters: {', '.join(missing_vars)}")
+# ——— Configuration ———
+PROJECT_ID              = os.getenv('GCP_PROJECT_ID', 'profit-scout-456416')
+GCS_BUCKET_NAME         = os.getenv('GCS_BUCKET_NAME', 'profit-scout')
+GCS_PDF_PREFIX          = os.getenv('GCS_PDF_PREFIX', 'sec-pdf/').rstrip('/') + '/'
+GCS_ANALYSIS_TXT_PREFIX = os.getenv('GCS_ANALYSIS_TXT_PREFIX', 'sec-analysis/').rstrip('/') + '/'
+GCS_TEMP_PREFIX         = os.getenv('GCS_TEMP_PREFIX', 'sec-pdf/tmp/').rstrip('/') + '/'
 
-if not GCP_LIBS_AVAILABLE or not GEMINI_LIB_AVAILABLE:
-     raise RuntimeError("Required libraries (GCP, google-generativeai, pandas) are not available.")
+SECRET_ID   = os.getenv('GEMINI_API_SECRET_ID', 'gemini-api-key')
+SECRET_VER  = os.getenv('GEMINI_API_KEY_SECRET_VERSION', 'latest')
+MODEL_NAME  = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash-001')
+TEMPERATURE = float(os.getenv('GEMINI_TEMPERATURE', '0.2'))
+MAX_TOKENS  = int(os.getenv('GEMINI_MAX_TOKENS', '8192'))
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '2'))
 
-# --- Global Clients (Initialize later) ---
-gcs_client = None
-secret_client = None
-gemini_api_key = None
-gemini_model = None
+# ——— Logging ———
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# --- Analysis Prompt (Copied from notebook script Part 4) ---
-# Ensure this is the prompt you want to use
-qualitative_analysis_prompt = """
-You are an expert financial analyst reviewing an SEC filing (10-K or 10-Q).
-Your task is to extract key financial performance indicators AND synthesize them into a qualitative assessment based *strictly* on the information presented within this document.
-Follow these steps:
+# ——— Prompt ———
+QUAL_PROMPT = """
+You are a top-tier financial analyst tasked with analyzing an SEC filing (10-K or 10-Q) to extract critical performance data and insights. Your output serves two goals:  
+(1) A financial analysis bot assessing company health, and  
+(2) An ML model predicting stock price appreciation over the next 90 days.  
 
-1.  **Extract Key Financial Data & Trends**:
-    * Identify primary figures (Revenue, Operating Income, Net Income, EPS, Operating Cash Flow, Key Debt metric, RMR/ARR if applicable).
-    * For each, state the value for the current period and the prior year period.
-    * **Calculate and state the Year-over-Year percentage change.**
-    * **If possible, state if this YoY change represents an acceleration or deceleration compared to the previous year's YoY change.** (e.g., "Revenue growth accelerated to 15% YoY from 5% prior YoY").
-2.  **Identify Key Qualitative Signals from the Filing**:
-    * Based *only* on the data and discussion *in the filing*, identify the **Top 2-3 Qualitative Strengths**. Link to specific data/metrics from Step 1 where applicable (e.g., "Strong Revenue Growth (+15% YoY)"). Be concise.
-    * Identify the **Top 2-3 Qualitative Weaknesses/Concerns**. Link to specific data/metrics from Step 1 where applicable (e.g., "Margin Pressure (Operating Margin down 200bps YoY)"). Be concise.
-3.  **Synthesize Overall Qualitative Assessment**:
-    * Provide a brief summary paragraph synthesizing the key changes, strengths, and weaknesses identified above.
-    * Conclude this paragraph by stating whether the overall qualitative picture *presented solely within this document* appears predominantly **Positive**, **Negative**, or **Mixed**.
-    * **Also assess the overall management tone conveyed in the filing (e.g., Confident, Optimistic, Cautious, Neutral, Defensive) based only on the language used.**
-4.  **Summarize Investment Implications (from Filing)**:
-    * Briefly list the key factors (derived from the points above) from *this specific filing* most relevant for investment. Focus on *changes* and *outlook*.
-    * **Do NOT provide a recommendation.**
-5.  **Extract Key Guidance & Outlook (from Filing)**:
-    * Summarize any **explicit financial guidance** (e.g., revenue/EPS ranges for next Q/Year) mentioned *within this document*. State "None provided" if applicable.
-    * Summarize management's qualitative outlook regarding future business prospects or key strategic initiatives *mentioned within this document*. State "None provided" if applicable.
+Keep it concise, metric-driven, and ML-ready with standardized formats.  
+Base all insights strictly on the content of the SEC filing.
 
-**Output Format**:
-Your output should be clearly structured using bullet points for steps 1, 2, 4, and 5, and a paragraph for step 3. Ensure the analysis remains objective and grounded *exclusively* in the provided SEC filing text.
-Avoid external information or real-time market data. Ensure the full analysis is included without truncation. Be concise in each bullet point.
+---
 
-CRITICAL INSTRUCTION: Your response MUST contain ONLY the requested analysis sections (Key Data/Trends, Qualitative Signals, Qualitative Assessment, Investment Implications, Guidance/Outlook).
-Do NOT include any introductory sentences, concluding remarks, warnings, or disclaimers stating that this is not financial advice or that the analysis is based only on the provided text.
-Output *only* the structured analysis itself.
+**Instructions**:
+
+1. **Key Metrics & Trends**  
+   * List: Revenue, Op Income, Net Income, EPS, Op Cash Flow, Debt (e.g., Total Debt).  
+   * Format: “[Metric]: [Current]; [YoY %]; [Accel/Decel or N/A].”  
+   * Example: “Revenue: $100M; +11.1%; Accel from +5%.”
+
+2. **Strengths & Risks**  
+   * 2–3 Strengths, 2–3 Risks, tied to metrics.  
+   * Format: “[Signal]: [Metric].”  
+   * Example: “Strong Growth: Revenue +11.1%.”
+
+3. **Performance Snapshot**  
+   * 3-sentence summary of trends and tone.  
+   * End with: “Sentiment: [Pos/Neg/Mix]; Tone: [e.g., Confident, Cautious, Uncertain].”
+
+4. **Investment Signals**  
+   * 2–3 metric-based factors investors should know.  
+   * Format: “[Factor]: [Metric].”  
+   * Example: “Growth Driver: Revenue +11.1%.”
+
+5. **Guidance & Catalysts**  
+   * Guidance: e.g., “Revenue $110M–$120M” or “None.”  
+   * Outlook: e.g., “Bullish, new product” or “None.”  
+   * End with: “Outlook: [Bull/Bear/Neu]; Catalyst: [e.g., Product, Macro, None].”
+
+---
+
+**CRITICAL INSTRUCTIONS**:
+
+- **Output only the analysis.**
+- **Do not include introductions, disclaimers, or speculative content.**
+- **Use only the SEC filing — no outside data or assumptions.**
+- **Keep content concise, structured, and predictive.**
+- **Follow the exact section format and tags for machine-readability.**
+
+---
+
+**Output Example**:
+
+* **Key Metrics & Trends**:  
+  * Revenue: $100M; +11.1%; Accel from +5%  
+  * Net Income: -$10M; -50%; N/A  
+
+* **Strengths & Risks**:  
+  * Strong Growth: Revenue +11.1%  
+  * Profit Risk: Net Income -$10M  
+
+* **Performance Snapshot**:  
+  Revenue grew 11.1% with acceleration, but losses widened. Management is optimistic about new products. Outlook is mixed.  
+  Sentiment: Mix; Tone: Optimistic  
+
+* **Investment Signals**:  
+  * Growth Driver: Revenue +11.1%  
+  * Loss Concern: Net Income -$10M  
+
+* **Guidance & Catalysts**:  
+  * Guidance: None  
+  * Outlook: Bullish, new product  
+  * Outlook: Bull; Catalyst: Product
 """
 
-# --- Helper Functions ---
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-def access_secret_version(project_id, secret_id, version_id="latest"):
-    """Accesses a secret version from Google Secret Manager."""
-    global secret_client
-    if not secret_client:
-        logging.info("Initializing Secret Manager client...")
-        secret_client = secretmanager.SecretManagerServiceClient()
-    # ... (rest of function is same as before) ...
-    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-    try:
-        response = secret_client.access_secret_version(request={"name": name})
-        payload = response.payload.data.decode("UTF-8").strip()
-        logging.info(f"Successfully accessed secret: {secret_id}")
-        if not payload:
-             raise ValueError(f"Secret {secret_id} version {version_id} exists but is empty.")
-        return payload
-    except google.api_core.exceptions.NotFound:
-        logging.error(f"Secret '{secret_id}' or version '{version_id}' not found in project '{project_id}'.")
-        raise
-    except Exception as e:
-        logging.error(f"Failed to access secret '{secret_id}/{version_id}' in project '{project_id}': {e}", exc_info=True)
-        raise
+# ——— Helper Functions ———
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def get_secret(secret_id, version="latest"):
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/{version}"
+    return client.access_secret_version(request={"name": name}).payload.data.decode().strip()
 
-def check_gcs_blob_exists(bucket, blob_name):
-    """Checks if a specific blob exists in the GCS bucket."""
-    try:
-        blob = bucket.blob(blob_name)
-        exists = blob.exists()
-        logging.info(f"Checking existence for gs://{bucket.name}/{blob_name}: {'Exists' if exists else 'Does not exist'}")
-        return exists
-    except Exception as e:
-        logging.error(f"Error checking GCS existence for {blob_name}: {e}", exc_info=True)
-        return False # Assume doesn't exist on error
+def extract_info_from_filename(gcs_path):
+    """
+    Split on the first underscore: TICKER_ACCESSION.pdf
+    """
+    filename = os.path.basename(gcs_path)
+    name, _ = os.path.splitext(filename)
+    if "_" not in name:
+        logging.warning(f"Cannot parse ticker/accession from filename: {filename}")
+        return None, None, None, None
+    ticker, accession = name.split("_", 1)
+    return ticker.upper(), None, None, accession
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-def download_from_gcs(bucket, blob_name, local_path):
-    """Downloads a file from GCS."""
-    logging.info(f"Downloading gs://{bucket.name}/{blob_name} to {local_path}")
-    blob = bucket.blob(blob_name)
-    try:
-        blob.download_to_filename(local_path)
-        if not os.path.exists(local_path) or os.path.getsize(local_path) < 100:
-             raise IOError(f"Downloaded file {local_path} missing or appears empty.")
-        logging.info(f"Successfully downloaded GCS file ({os.path.getsize(local_path)/1024:.1f} KB).")
-    except Exception as e:
-        logging.error(f"Failed to download gs://{bucket.name}/{blob_name}: {e}", exc_info=True)
-        raise
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def upload_to_gcs(bucket, local_path, gcs_path):
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path)
+    return f"gs://{bucket.name}/{gcs_path}"
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20), reraise=True)
-async def upload_to_gemini_async(local_path, display_name):
-    """Uploads local file to Gemini File API, waits until ACTIVE."""
-    if not GEMINI_LIB_AVAILABLE: return None # Should not happen if validation passed
-    if not gemini_model: raise RuntimeError("Gemini client not initialized.")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def delete_from_gcs(bucket, gcs_path):
+    blob = bucket.blob(gcs_path)
+    if blob.exists():
+        blob.delete()
 
-    logging.info(f"Uploading {display_name} to Gemini File API...")
-    uploaded_file = None
-    loop = asyncio.get_running_loop()
-    try:
-        # Run synchronous genai.upload_file in executor
-        uploaded_file = await loop.run_in_executor(None, genai.upload_file, local_path, display_name=display_name)
-        logging.info(f"Initial upload request sent ({uploaded_file.name}). Waiting for ACTIVE state...")
+RETRYABLE_EXCEPTIONS = (
+    core_exceptions.GoogleAPICallError,
+    core_exceptions.RetryError,
+    core_exceptions.ServerError,
+    core_exceptions.ServiceUnavailable,
+    ConnectionAbortedError
+)
 
-        attempts = 0
-        max_attempts = 60 # Wait up to 2 minutes (60 * 2 sec)
-        while uploaded_file.state.name != "ACTIVE" and attempts < max_attempts:
-            await asyncio.sleep(2)
-            # Run synchronous genai.get_file in executor
-            uploaded_file = await loop.run_in_executor(None, genai.get_file, uploaded_file.name)
-            attempts += 1
-            logging.debug(f"File {uploaded_file.name} state: {uploaded_file.state.name}. Attempt {attempts}/{max_attempts}")
-            if uploaded_file.state.name == "FAILED":
-                raise google.api_core.exceptions.GoogleAPICallError(f"Gemini file processing failed: {uploaded_file.name}. State: {uploaded_file.state}")
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(min=4, max=20),
+    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+    reraise=True
+)
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(min=4, max=20),
+    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+    reraise=True
+)
+async def upload_to_gemini(client, local_pdf):
+    # Upload, get back a File object
+    file_obj = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: client.files.upload(file=local_pdf)
+    )
+    logging.info(f"Uploaded {local_pdf} → {file_obj.uri}")
+    return file_obj, None
 
-        if uploaded_file.state.name != "ACTIVE":
-            raise TimeoutError(f"Gemini file {uploaded_file.name} did not become ACTIVE after {attempts * 2} seconds.")
+async def generate_analysis(client, file_obj):
+    """
+    Generate qualitative analysis for a PDF uploaded to Gemini File API.
+    :param client: genai.Client instance
+    :param file_obj: FileData object returned by client.files.upload(...)
+    :returns: str (the generated analysis text)
+    """
+    # Configure model parameters
+    config = GenerateContentConfig(
+        temperature=TEMPERATURE,
+        max_output_tokens=MAX_TOKENS
+    )
 
-        logging.info(f"File {uploaded_file.name} is ACTIVE.")
-        return uploaded_file
-    except Exception as e:
-        logging.error(f"Error during Gemini upload/processing for {display_name}: {e}", exc_info=True)
-        # Attempt cleanup if upload started but failed processing
-        if uploaded_file and uploaded_file.name:
-            logging.warning(f"Attempting to delete potentially failed Gemini upload: {uploaded_file.name}")
-            await delete_gemini_file_async(uploaded_file.name) # Needs to be async
-        raise # Re-raise the original error
+    # Include the uploaded file object, then your prompt
+    contents = [
+        file_obj,
+        Part.from_text(text=QUAL_PROMPT)  
+    ]
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60), reraise=True)
-async def generate_content_async(model_instance, prompt_list):
-    """Generates content using Gemini model with retry."""
-    if not model_instance: raise RuntimeError("Gemini model not initialized.")
-
-    logging.info("Generating content via Gemini...")
-    request_options = {"timeout": GEMINI_REQ_TIMEOUT}
-    loop = asyncio.get_running_loop()
-    response_text = "Error: Content generation failed unexpectedly."
-    try:
-        # Run synchronous generate_content in executor
-        response = await loop.run_in_executor(
-            None,
-            model_instance.generate_content,
-            prompt_list,
-            request_options=request_options
+    # Run the multimodal generation call on a background thread
+    response = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=config
         )
-        logging.info("Received response from Gemini.")
+    )
 
-        # --- Robust response handling (from notebook script) ---
-        if hasattr(response, 'text') and response.text:
-            response_text = response.text
-            logging.info("Content generation successful (from text).")
-        elif hasattr(response, 'parts') and response.parts:
-            response_text = "".join(part.text for part in response.parts if hasattr(part, 'text'))
-            if response_text:
-                logging.info("Content generation successful (from parts).")
-            else:
-                logging.warning(f"Gemini returned parts but no text content. Parts: {response.parts}")
-                response_text = "Error: Content generation returned empty parts."
-        elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            reason = response.prompt_feedback.block_reason_message or response.prompt_feedback.block_reason
-            logging.error(f"Content generation blocked. Reason: {reason}")
-            response_text = f"Error: Content generation blocked ({reason})"
+    # Extract result text
+    if response.text:
+        return response.text
+    if hasattr(response, "parts"):
+        return "".join(p.text for p in response.parts if hasattr(p, "text"))
+    raise RuntimeError("Empty response from Gemini")
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def download_pdf(bucket, blob_name, local_path):
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(local_path)
+    if not os.path.exists(local_path) or os.path.getsize(local_path) < 100:
+        raise IOError("Downloaded PDF missing or appears empty.")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def upload_txt(bucket, local_path, blob_path):
+    bucket.blob(blob_path).upload_from_filename(local_path)
+
+async def process_pdf(client, bucket, blob_name, temp_dir):
+    basename = os.path.basename(blob_name)
+    ticker, _, _, accession_no = extract_info_from_filename(blob_name)
+    if not ticker or not accession_no:
+        return 'skipped_parse'
+
+    key = f"{ticker}_{accession_no}"
+    txt_blob_path = f"{GCS_ANALYSIS_TXT_PREFIX}{key}.txt"
+    if bucket.blob(txt_blob_path).exists():
+        return 'skipped_existing'
+
+    logging.info(f"Processing {key}")
+    status = 'error_unexpected'
+    local_pdf = os.path.join(temp_dir, basename)
+    local_txt = None
+    temp_gcs_path = None
+
+    try:
+        download_pdf(bucket, blob_name, local_pdf)
+        file_obj, temp_gcs_path = await upload_to_gemini(client, local_pdf)
+        logging.info(f"[{ticker}] Gemini File URI: {file_obj.uri}")
+
+        analysis = await generate_analysis(client, file_obj)
+        status = 'success'
+
+        local_txt = os.path.join(temp_dir, f"{key}.txt")
+        with open(local_txt, 'w', encoding='utf-8') as f:
+            f.write(analysis)
+        upload_txt(bucket, local_txt, txt_blob_path)
+        logging.info(f"[{ticker}] Saved analysis to: gs://{GCS_BUCKET_NAME}/{txt_blob_path}")
+
+    except Exception as e:
+        logging.error(f"[{ticker}] Failed processing {key}: {e}")
+        if isinstance(e, core_exceptions.BadRequest):
+            status = 'error_generate_bad_pdf'
+        elif isinstance(e, (core_exceptions.GoogleAPICallError, TimeoutError)):
+            status = 'error_generate'
         else:
-            logging.warning(f"Gemini returned no text/parts or block reason. Candidates: {getattr(response, 'candidates', 'N/A')}")
-            response_text = "Error: Content generation returned unknown empty response."
-        # --- End robust handling ---
+            status = 'error_worker'
 
-        # Raise error if generation failed or was blocked to trigger retry or mark failure
-        if response_text.startswith("Error:"):
-             raise google.api_core.exceptions.GoogleAPICallError(response_text)
-
-        return response_text
-
-    except google.api_core.exceptions.GoogleAPICallError as api_error:
-        logging.error(f"Gemini API Call Error: {api_error}", exc_info=True)
-        raise # Reraise for tenacity
-    except Exception as e:
-        logging.error(f"Unexpected Error during Gemini content generation: {e}", exc_info=True)
-        raise # Reraise
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5), reraise=True)
-async def delete_gemini_file_async(file_name):
-    """Requests deletion of a file from Gemini File API with retry."""
-    if not GEMINI_LIB_AVAILABLE: return
-    if not file_name:
-        logging.debug("No Gemini file name provided to delete.")
-        return
-
-    logging.info(f"Requesting deletion of Gemini file: {file_name}")
-    loop = asyncio.get_running_loop()
-    try:
-        # Run synchronous delete_file in executor
-        await loop.run_in_executor(None, genai.delete_file, file_name)
-        logging.info(f"Successfully requested deletion of Gemini file: {file_name}")
-    except Exception as e:
-        # Log warning but don't fail the whole job if cleanup fails
-        logging.warning(f"Failed to delete Gemini file {file_name} (will continue): {e}")
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-def upload_to_gcs(bucket, local_path, blob_path, content_type='text/plain'):
-    """Uploads a local file to GCS with retries."""
-    logging.info(f"Uploading {local_path} to gs://{bucket.name}/{blob_path}")
-    blob = bucket.blob(blob_path)
-    try:
-        blob.upload_from_filename(local_path, content_type=content_type)
-        logging.info(f"Successfully uploaded to gs://{bucket.name}/{blob_path}")
-    except Exception as e:
-        logging.error(f"Failed to upload {local_path} to GCS: {e}", exc_info=True)
-        raise # Reraise for tenacity
-
-# --- Main Execution Logic ---
-async def main():
-    global gcs_client, gemini_api_key, gemini_model
-    start_time = time.time()
-    status = "started"
-    analysis_txt_gcs_uri = None
-    metadata_csv_gcs_uri = None
-    local_pdf_path = None
-    local_txt_path = None
-    local_csv_path = None
-    uploaded_gemini_file = None
-    log_prefix = f"{INPUT_TICKER} - {INPUT_ACCESSION_NUMBER}"
-    logging.info(f"--- Starting Qualitative Analysis Job for {log_prefix} ---")
-    logging.info(f"Input PDF GCS Path: {INPUT_PDF_GCS_PATH}")
-
-    # Derive output paths
-    base_filename = f"{INPUT_TICKER}_{INPUT_FILING_DATE}_{INPUT_FORM_TYPE}_{INPUT_ACCESSION_NUMBER}" # Reconstruct base name
-    txt_filename = f"{base_filename}_analysis.txt"
-    csv_filename = f"{base_filename}_metadata.csv"
-    gcs_txt_path = os.path.join(GCS_QUALITATIVE_TXT_PREFIX, txt_filename)
-    gcs_csv_path = os.path.join(GCS_METADATA_CSV_PREFIX, csv_filename)
-
-    temp_dir = tempfile.mkdtemp() # Create a temporary directory for this run
-
-    try:
-        # Initialize GCS Client using ADC
-        logging.info(f"Initializing GCS client for project {GCP_PROJECT_ID}...")
-        gcs_client = storage.Client(project=GCP_PROJECT_ID)
-        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-        logging.info(f"GCS client initialized for bucket '{GCS_BUCKET_NAME}'.")
-
-        # Check if output TXT already exists
-        if check_gcs_blob_exists(bucket, gcs_txt_path):
-            logging.info(f"Analysis TXT already exists: gs://{GCS_BUCKET_NAME}/{gcs_txt_path}. Skipping.")
-            status = "skipped_exists"
-            analysis_txt_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_txt_path}" # Still report existing path
-        else:
-            # Get Gemini API Key from Secret Manager
-            gemini_api_key = access_secret_version(GCP_PROJECT_ID, GEMINI_API_SECRET_ID, GEMINI_API_KEY_SECRET_VERSION)
-            genai.configure(api_key=gemini_api_key)
-            gemini_model = genai.GenerativeModel(
-                GEMINI_MODEL_NAME,
-                generation_config={"temperature": GEMINI_TEMPERATURE, "max_output_tokens": GEMINI_MAX_TOKENS}
-            )
-            logging.info(f"Gemini client initialized with model {GEMINI_MODEL_NAME}.")
-
-            # Download input PDF from GCS
-            if not INPUT_PDF_GCS_PATH.startswith(f"gs://{GCS_BUCKET_NAME}/"):
-                raise ValueError(f"Input PDF path {INPUT_PDF_GCS_PATH} does not match bucket {GCS_BUCKET_NAME}")
-            input_blob_name = INPUT_PDF_GCS_PATH[len(f"gs://{GCS_BUCKET_NAME}/"):]
-            local_pdf_path = os.path.join(temp_dir, os.path.basename(input_blob_name))
-            download_from_gcs(bucket, input_blob_name, local_pdf_path)
-
-            # Upload PDF to Gemini File API
-            display_name = os.path.basename(local_pdf_path)
-            uploaded_gemini_file = await upload_to_gemini_async(local_pdf_path, display_name)
-            status = "gemini_uploaded"
-
-            # Generate Analysis
-            analysis_text = await generate_content_async(gemini_model, [qualitative_analysis_prompt, uploaded_gemini_file])
-            status = "analysis_generated"
-
-            # Save Analysis TXT locally
-            local_txt_path = os.path.join(temp_dir, txt_filename)
-            with open(local_txt_path, 'w', encoding='utf-8') as f_txt:
-                f_txt.write(analysis_text)
-            logging.info(f"Analysis text saved locally to {local_txt_path}")
-
-            # Upload Analysis TXT to GCS
-            upload_to_gcs(bucket, local_txt_path, gcs_txt_path, content_type='text/plain')
-            analysis_txt_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_txt_path}"
-            status = "analysis_uploaded"
-
-        # --- Always create and upload metadata CSV ---
-        processing_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        metadata_dict = {
-            'Ticker': [INPUT_TICKER],
-            'FormType': [INPUT_FORM_TYPE],
-            'FilingDate': [INPUT_FILING_DATE],
-            'AccessionNumber': [INPUT_ACCESSION_NUMBER],
-            'SourcePDF_GCS_Path': [INPUT_PDF_GCS_PATH],
-            'AnalysisTXT_GCS_Path': [analysis_txt_gcs_uri], # Use variable which might be from check_exists
-            'ProcessingTimestampUTC': [processing_timestamp],
-            'ProcessingStatus': [status], # Reflects the final status of this run
-            'ModelUsed': [GEMINI_MODEL_NAME if status not in ['started', 'skipped_exists'] else 'N/A']
-        }
-        df_meta = pd.DataFrame(metadata_dict)
-        local_csv_path = os.path.join(temp_dir, csv_filename)
-        df_meta.to_csv(local_csv_path, index=False, encoding='utf-8')
-        logging.info(f"Metadata CSV saved locally to {local_csv_path}")
-
-        # Upload Metadata CSV to GCS
-        upload_to_gcs(bucket, local_csv_path, gcs_csv_path, content_type='text/csv')
-        metadata_csv_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_csv_path}"
-        logging.info(f"Metadata CSV uploaded to {metadata_csv_gcs_uri}")
-        # --- End Metadata CSV Handling ---
-
-        # Final status determination
-        if status not in ['skipped_exists', 'analysis_uploaded']:
-             # If it wasn't skipped and didn't complete upload, mark as error
-             if not status.startswith("error_"): status = "error_incomplete"
-        elif status == 'analysis_uploaded':
-            status = 'success' # Mark explicit success only if analysis was generated and uploaded
-
-        # --- Output for Workflow ---
-        output_data = {
-            "job_name": "generate-qualitative-analysis",
-            "ticker": INPUT_TICKER,
-            "accession_number": INPUT_ACCESSION_NUMBER,
-            "status": status,
-            "input_pdf_gcs_path": INPUT_PDF_GCS_PATH,
-            "output_analysis_txt_gcs_path": analysis_txt_gcs_uri,
-            "output_metadata_csv_gcs_path": metadata_csv_gcs_uri
-        }
-        print(json.dumps(output_data)) # Log output as JSON
-
-    except google.auth.exceptions.DefaultCredentialsError as cred_err:
-        logging.critical(f"GCP Credentials Error: {cred_err}", exc_info=True)
-        status = "error_auth"
-        print(json.dumps({ "job_name": "generate-qualitative-analysis", "status": status, "error": str(cred_err) }))
-        raise
-    except Exception as e:
-        logging.error(f"An error occurred during the qualitative-analysis job for {log_prefix}: {e}", exc_info=True)
-        status = "error_runtime"
-        print(json.dumps({ "job_name": "generate-qualitative-analysis", "status": status, "error": str(e) }))
-        raise
     finally:
-        # Cleanup Gemini File if it was created
-        if uploaded_gemini_file and uploaded_gemini_file.name:
-            await delete_gemini_file_async(uploaded_gemini_file.name) # Needs await
+        if temp_gcs_path:
+            try:
+                delete_from_gcs(bucket, temp_gcs_path)
+            except Exception:
+                pass
+        for path in [local_pdf, local_txt]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
-        # Cleanup local files/directory
-        logging.debug(f"Cleaning up temporary directory: {temp_dir}")
-        for local_path in [local_pdf_path, local_txt_path, local_csv_path]:
-             if local_path and os.path.exists(local_path):
-                 try: os.remove(local_path)
-                 except OSError as rm_err: logging.warning(f"Could not remove temp file {local_path}: {rm_err}")
-        if os.path.exists(temp_dir):
-             try: os.rmdir(temp_dir)
-             except OSError as rmdir_err: logging.warning(f"Could not remove temp dir {temp_dir}: {rmdir_err}")
+    return status
 
-        end_time = time.time()
-        logging.info(f"--- Qualitative Analysis Job for {log_prefix} finished in {end_time - start_time:.2f} seconds. Final Status: {status} ---")
+async def main():
+    start = time.time()
+    results_summary = {
+        'success': 0, 'error_generate': 0, 'error_generate_bad_pdf': 0,
+        'error_worker': 0, 'skipped_parse': 0, 'skipped_existing': 0
+    }
+    try:
+        import google.genai
+        logging.info(f"Google GenAI SDK version: {google.genai.__version__}")
+        logging.info(f"Client methods: {dir(genai.Client)}")
+        api_key = get_secret(SECRET_ID, SECRET_VER)
+        client = genai.Client(api_key=api_key, http_options=HttpOptions(api_version='v1beta'))
+        gcs_client = storage.Client(project=PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
 
-if __name__ == "__main__":
-    # Run the async main function
-    asyncio.run(main())
+        blobs = [
+            b.name
+            for b in bucket.list_blobs(prefix=GCS_PDF_PREFIX)
+            if b.name.lower().endswith('.pdf')
+        ]
+        logging.info(f"Found {len(blobs)} PDFs to process")
+
+        temp_dir = tempfile.mkdtemp()
+        sem = asyncio.Semaphore(MAX_WORKERS)
+
+        async def sem_task(blob_name):
+            async with sem:
+                status = await process_pdf(client, bucket, blob_name, temp_dir)
+                results_summary[status] += 1
+
+        await asyncio.gather(*(sem_task(b) for b in blobs))
+
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+
+        total_errors = sum(v for k, v in results_summary.items() if 'error' in k)
+        total_skipped = results_summary['skipped_parse'] + results_summary['skipped_existing']
+        logging.info(f"""
+Processing Summary:
+  Total PDFs:           {len(blobs)}
+  Skipped parses:       {results_summary['skipped_parse']}
+  Already exists:       {results_summary['skipped_existing']}
+  Successes:            {results_summary['success']}
+  Errors:               {total_errors}
+Elapsed time:          {time.time() - start:.1f}s
+""")
+
+    except Exception as fatal:
+        logging.critical(f"Fatal error in batch execution: {fatal}", exc_info=True)
+        raise
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception:
+        logging.critical("Fatal error in batch execution", exc_info=True)
+        exit(1)
